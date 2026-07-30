@@ -3,6 +3,7 @@ set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 APP_NAME="AudioFocus"
+HELPER_NAME="AudioFocusNativeHost"
 BUNDLE_DIR="$PROJECT_DIR/${APP_NAME}.app"
 
 echo "=== Building ${APP_NAME} ==="
@@ -22,17 +23,22 @@ swift build -c release 2>&1 || swift build 2>&1
 # Determine which binary to use
 if [ -f "$PROJECT_DIR/.build/release/${APP_NAME}" ]; then
     BINARY_SRC="$PROJECT_DIR/.build/release/${APP_NAME}"
+    HELPER_SRC="$PROJECT_DIR/.build/release/${HELPER_NAME}"
 else
     BINARY_SRC="$PROJECT_DIR/.build/debug/${APP_NAME}"
+    HELPER_SRC="$PROJECT_DIR/.build/debug/${HELPER_NAME}"
 fi
 
 # 3. Create app bundle
 echo "=== Creating app bundle ==="
 mkdir -p "$BUNDLE_DIR/Contents/MacOS"
+mkdir -p "$BUNDLE_DIR/Contents/Helpers"
 mkdir -p "$BUNDLE_DIR/Contents/Resources"
 
 cp "$BINARY_SRC" "$BUNDLE_DIR/Contents/MacOS/${APP_NAME}"
 chmod +x "$BUNDLE_DIR/Contents/MacOS/${APP_NAME}"
+cp "$HELPER_SRC" "$BUNDLE_DIR/Contents/Helpers/${HELPER_NAME}"
+chmod +x "$BUNDLE_DIR/Contents/Helpers/${HELPER_NAME}"
 
 # 4. Create Info.plist
 cat > "$BUNDLE_DIR/Contents/Info.plist" << 'PLISTEOF'

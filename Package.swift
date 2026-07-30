@@ -8,6 +8,10 @@ let package = Package(
         .executableTarget(
             name: "AudioFocus",
             path: "Sources/AudioFocus"
+        ),
+        .executableTarget(
+            name: "AudioFocusNativeHost",
+            path: "Sources/AudioFocusNativeHost"
         )
     ]
 )

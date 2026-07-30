@@ -3,7 +3,7 @@
   "name": "AudioFocus Tab Controller",
   "version": "1.0.0",
   "description": "Keeps the last focused audible tab playing and fades other tabs out.",
-  "permissions": ["tabs", "<all_urls>"],
+  "permissions": ["tabs", "nativeMessaging", "<all_urls>"],
   "background": {
     "scripts": ["background.js"]
   },

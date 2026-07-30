@@ -11,6 +11,8 @@ Behavior:
 - The new owner is unmuted and its HTML `<audio>` / `<video>` elements fade in.
 - WebAudio and protected browser pages cannot expose their gain to a content script;
   they use the final tab mute without a gradual fade.
+- The switch delay is read from the AudioFocus menu through the bundled native
+  messaging host and updates within about one second.
 
 ## Chrome
 
@@ -18,6 +20,9 @@ Behavior:
 2. Enable **Developer mode**.
 3. Click **Load unpacked**.
 4. Select the `chrome` folder.
+
+If an older unpacked copy is installed, remove it first and load this folder again.
+The current extension uses the fixed ID `pijagplcjlcnlgafkcegnbdjkgeoheak`.
 
 ## Firefox
 
@@ -27,3 +32,6 @@ Behavior:
 
 Firefox removes temporary extensions when it restarts. Permanent installation
 requires Mozilla signing or an enterprise policy.
+
+AudioFocus installs the Chrome and Firefox native-host manifests when the app
+starts. Reload the extension after replacing the app bundle.

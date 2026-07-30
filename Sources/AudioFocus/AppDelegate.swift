@@ -28,6 +28,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         )
 
         loadPreferences()
+        SettingsBridge.write(switchDelay: switchDelay, whitelistBundleIDs: whitelistBundleIDs)
+        SettingsBridge.installNativeMessagingHosts()
         audioManager.setSwitchDelay(switchDelay)
         audioManager.setWhitelist(whitelistBundleIDs)
 
@@ -288,6 +290,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let number = sender.representedObject as? NSNumber else { return }
         switchDelay = max(0, number.doubleValue)
         UserDefaults.standard.set(switchDelay, forKey: switchDelayKey)
+        SettingsBridge.write(switchDelay: switchDelay, whitelistBundleIDs: whitelistBundleIDs)
         audioManager.setSwitchDelay(switchDelay)
         if let menu = statusItem.menu { populateMenu(menu) }
     }
@@ -313,6 +316,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func saveWhitelist() {
         UserDefaults.standard.set(whitelistBundleIDs.sorted(), forKey: whitelistKey)
+        SettingsBridge.write(switchDelay: switchDelay, whitelistBundleIDs: whitelistBundleIDs)
     }
 
     @objc private func toggleEnabled() {

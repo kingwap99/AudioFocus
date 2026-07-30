@@ -20,6 +20,7 @@ last audible tab.
 - Lists foreground window titles and the complete muted app/process list.
 - Offers a persistent switch-delay setting (immediate to 3 seconds).
 - Offers a persistent, directly selectable application whitelist.
+- Bundles a native messaging host that synchronizes menu settings to Chrome and Firefox.
 - Shows a build timestamp and live audio-pipeline status in the menu.
 - Chrome and Firefox extensions provide per-tab audible-focus control.
 - Browser HTML audio/video fades over 450 ms before tab mute is applied.
@@ -49,6 +50,9 @@ the `.app` bundle, and applies an ad-hoc signature.
 3. Click **Load unpacked**.
 4. Select `BrowserExtensions/chrome`.
 
+The extension has a fixed development ID (`pijagplcjlcnlgafkcegnbdjkgeoheak`)
+so AudioFocus can grant it native-host access consistently.
+
 ### Firefox
 
 1. Open `about:debugging#/runtime/this-firefox`.
@@ -69,7 +73,10 @@ captured audio.
 
 Browser extensions use the WebExtensions `Tab.audible` state. A silent focused tab
 does not replace the previous owner. When an audible tab is selected, HTML media
-elements are faded and all other managed tabs are muted.
+elements are faded and all other managed tabs are muted. The bundled
+`AudioFocusNativeHost` uses length-prefixed JSON over stdin/stdout to provide the
+app's current switch delay to both extensions. Native-host manifests are installed
+in the user's Chrome and Firefox application-support folders when AudioFocus starts.
 
 ## Limitations
 

@@ -15,12 +15,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var isEnabled = true
     private var mutedProcesses: [AudioProcessInfo] = []
     private var audioStatus = "Starting…"
+    private var switchDelay: TimeInterval = 0.5
+    private var whitelistBundleIDs = Set<String>()
+
+    private let switchDelayKey = "AudioFocus.switchDelay"
+    private let whitelistKey = "AudioFocus.whitelistBundleIDs"
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         activity = ProcessInfo.processInfo.beginActivity(
             options: [.automaticTerminationDisabled, .suddenTerminationDisabled, .userInitiated],
             reason: "AudioFocus continuously manages foreground audio"
         )
+
+        loadPreferences()
+        audioManager.setSwitchDelay(switchDelay)
+        audioManager.setWhitelist(whitelistBundleIDs)
 
         requestAccessibilityPermissionIfNeeded()
         setupMenuBar()
@@ -29,6 +38,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         audioManager.startPolling(interval: 3.0)
         audioManager.muteAllExcept(bundleID: foregroundMonitor.currentForegroundBundleID)
         os_log(.info, log: Self.log, "AudioFocus ready")
+    }
+
+    private func loadPreferences() {
+        let defaults = UserDefaults.standard
+        if defaults.object(forKey: switchDelayKey) != nil {
+            switchDelay = max(0, defaults.double(forKey: switchDelayKey))
+        }
+        whitelistBundleIDs = Set(defaults.stringArray(forKey: whitelistKey) ?? [])
     }
 
     private func requestAccessibilityPermissionIfNeeded() {
@@ -70,6 +87,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         menu.addItem(.separator())
         addMutedItems(to: menu)
+
+        menu.addItem(.separator())
+        addSwitchDelayItem(to: menu)
+        addWhitelistItem(to: menu)
 
         menu.addItem(.separator())
         let toggle = NSMenuItem(
@@ -128,14 +149,83 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 let icon = isRunning ? "🔇" : "💤"
                 let name = displayName(for: processes.first)
                 let suffix = processes.count > 1 ? " ×\(processes.count)" : ""
-                submenu.addDisabledItem("\(icon) \(name)\(suffix)")
-                submenu.addDisabledItem("    \(bundleID)")
+                let item = NSMenuItem(
+                    title: "\(icon) \(name)\(suffix) — click to whitelist",
+                    action: #selector(toggleWhitelist(_:)),
+                    keyEquivalent: ""
+                )
+                item.target = self
+                item.representedObject = bundleID
+                item.toolTip = bundleID
+                submenu.addItem(item)
             }
         }
 
         parent.submenu = submenu
         menu.addItem(parent)
         menu.addDisabledItem("  Currently outputting: \(runningCount)")
+    }
+
+    private func addSwitchDelayItem(to menu: NSMenu) {
+        let parent = NSMenuItem(
+            title: String(format: "Switch delay: %.2fs", switchDelay),
+            action: nil,
+            keyEquivalent: ""
+        )
+        let submenu = NSMenu()
+        submenu.autoenablesItems = false
+
+        for delay in [0.0, 0.25, 0.5, 1.0, 2.0, 3.0] {
+            let title = delay == 0 ? "Immediate" : String(format: "%.2f seconds", delay)
+            let item = NSMenuItem(title: title, action: #selector(selectSwitchDelay(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = NSNumber(value: delay)
+            item.state = abs(delay - switchDelay) < 0.001 ? .on : .off
+            submenu.addItem(item)
+        }
+
+        parent.submenu = submenu
+        menu.addItem(parent)
+    }
+
+    private func addWhitelistItem(to menu: NSMenu) {
+        let parent = NSMenuItem(
+            title: "Whitelist: \(whitelistBundleIDs.count) apps",
+            action: nil,
+            keyEquivalent: ""
+        )
+        let submenu = NSMenu()
+        submenu.autoenablesItems = false
+
+        let detected = audioManager.getAudioProcesses().filter {
+            !$0.bundleID.isEmpty && $0.bundleID != "com.audiofocus.app"
+        }
+        let grouped = Dictionary(grouping: detected, by: \.bundleID)
+        let bundleIDs = Set(grouped.keys).union(whitelistBundleIDs).sorted()
+
+        if bundleIDs.isEmpty {
+            submenu.addDisabledItem("(no audio apps detected)")
+        } else {
+            for bundleID in bundleIDs {
+                let process = grouped[bundleID]?.first
+                let name = process.map { displayName(for: $0) } ?? bundleID
+                let item = NSMenuItem(title: name, action: #selector(toggleWhitelist(_:)), keyEquivalent: "")
+                item.target = self
+                item.representedObject = bundleID
+                item.toolTip = bundleID
+                item.state = whitelistBundleIDs.contains(bundleID) ? .on : .off
+                submenu.addItem(item)
+            }
+        }
+
+        submenu.addItem(.separator())
+        let clear = NSMenuItem(title: "Clear whitelist", action: #selector(clearWhitelist), keyEquivalent: "")
+        clear.target = self
+        clear.isEnabled = !whitelistBundleIDs.isEmpty
+        submenu.addItem(clear)
+
+        parent.submenu = submenu
+        menu.addItem(parent)
     }
 
     private func displayName(for process: AudioProcessInfo?) -> String {
@@ -192,6 +282,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func unique(_ values: [String]) -> [String] {
         var seen = Set<String>()
         return values.filter { seen.insert($0).inserted }
+    }
+
+    @objc private func selectSwitchDelay(_ sender: NSMenuItem) {
+        guard let number = sender.representedObject as? NSNumber else { return }
+        switchDelay = max(0, number.doubleValue)
+        UserDefaults.standard.set(switchDelay, forKey: switchDelayKey)
+        audioManager.setSwitchDelay(switchDelay)
+        if let menu = statusItem.menu { populateMenu(menu) }
+    }
+
+    @objc private func toggleWhitelist(_ sender: NSMenuItem) {
+        guard let bundleID = sender.representedObject as? String, !bundleID.isEmpty else { return }
+        if whitelistBundleIDs.contains(bundleID) {
+            whitelistBundleIDs.remove(bundleID)
+        } else {
+            whitelistBundleIDs.insert(bundleID)
+        }
+        saveWhitelist()
+        audioManager.setWhitelist(whitelistBundleIDs)
+        if let menu = statusItem.menu { populateMenu(menu) }
+    }
+
+    @objc private func clearWhitelist() {
+        whitelistBundleIDs.removeAll()
+        saveWhitelist()
+        audioManager.setWhitelist(whitelistBundleIDs)
+        if let menu = statusItem.menu { populateMenu(menu) }
+    }
+
+    private func saveWhitelist() {
+        UserDefaults.standard.set(whitelistBundleIDs.sorted(), forKey: whitelistKey)
     }
 
     @objc private func toggleEnabled() {

@@ -28,6 +28,10 @@ final class AudioManager {
     private var currentFocusBundleID: String?
     private var pendingForegroundBundleID: String?
     private var mutedObjectIDs = Set<AudioObjectID>()
+    private var whitelistBundleIDs = Set<String>()
+    private var switchDelay: TimeInterval = 0.5
+    private var candidateGeneration = 0
+    private var scheduledGeneration: Int?
 
     private let controlQueue = DispatchQueue(label: "com.audiofocus.audio-control", qos: .userInitiated)
     private let ioQueue = DispatchQueue(label: "com.audiofocus.audio-io", qos: .userInteractive)
@@ -119,7 +123,14 @@ final class AudioManager {
     private func mutedProcesses(from all: [AudioProcessInfo], foreground: String?) -> [AudioProcessInfo] {
         all.filter {
             !protectedBundleIDs.contains($0.bundleID)
+                && !isWhitelistedFamily($0.bundleID)
                 && !isForegroundFamily($0.bundleID, foreground: foreground)
+        }
+    }
+
+    private func isWhitelistedFamily(_ candidate: String) -> Bool {
+        whitelistBundleIDs.contains {
+            candidate == $0 || candidate.hasPrefix($0 + ".")
         }
     }
 
@@ -261,10 +272,12 @@ final class AudioManager {
         controlQueue.async { [weak self] in
             guard let self, let bundleID, !bundleID.isEmpty else { return }
             self.pendingForegroundBundleID = bundleID
+            self.candidateGeneration += 1
+            self.scheduledGeneration = nil
             let all = self.getAudioProcesses()
 
             if self.currentFocusBundleID == nil || self.familyIsOutputting(bundleID, in: all) {
-                self.applyFocus(bundleID, allProcesses: all)
+                self.scheduleCandidate(bundleID, generation: self.candidateGeneration)
             } else {
                 let owner = self.currentFocusBundleID ?? "none"
                 self.updateStatus("Holding \(owner); front window is silent")
@@ -272,9 +285,34 @@ final class AudioManager {
         }
     }
 
+    private func scheduleCandidate(_ bundleID: String, generation: Int) {
+        guard scheduledGeneration != generation else { return }
+        scheduledGeneration = generation
+
+        if switchDelay > 0 {
+            updateStatus(String(format: "Switching in %.2fs if audio stays active", switchDelay))
+        }
+
+        controlQueue.asyncAfter(deadline: .now() + switchDelay) { [weak self] in
+            guard let self,
+                  self.candidateGeneration == generation,
+                  self.pendingForegroundBundleID == bundleID else { return }
+            self.scheduledGeneration = nil
+
+            let latest = self.getAudioProcesses()
+            guard self.currentFocusBundleID == nil || self.familyIsOutputting(bundleID, in: latest) else {
+                let owner = self.currentFocusBundleID ?? "none"
+                self.updateStatus("Holding \(owner); candidate became silent")
+                return
+            }
+            self.applyFocus(bundleID, allProcesses: latest)
+        }
+    }
+
     private func applyFocus(_ bundleID: String, allProcesses: [AudioProcessInfo]? = nil) {
         currentFocusBundleID = bundleID
         pendingForegroundBundleID = nil
+        scheduledGeneration = nil
         let all = allProcesses ?? getAudioProcesses()
         let muted = mutedProcesses(from: all, foreground: bundleID)
         _ = createPipeline(for: muted)
@@ -287,6 +325,21 @@ final class AudioManager {
         controlQueue.async { [weak self] in
             guard let self, let bundleID, !bundleID.isEmpty else { return }
             self.applyFocus(bundleID)
+        }
+    }
+
+    func setSwitchDelay(_ delay: TimeInterval) {
+        controlQueue.async { [weak self] in
+            self?.switchDelay = max(0, delay)
+        }
+    }
+
+    func setWhitelist(_ bundleIDs: Set<String>) {
+        controlQueue.async { [weak self] in
+            guard let self else { return }
+            self.whitelistBundleIDs = bundleIDs
+            guard let focus = self.currentFocusBundleID else { return }
+            self.applyFocus(focus)
         }
     }
 
@@ -311,7 +364,7 @@ final class AudioManager {
 
             if let pending = self.pendingForegroundBundleID,
                self.familyIsOutputting(pending, in: all) {
-                self.applyFocus(pending, allProcesses: all)
+                self.scheduleCandidate(pending, generation: self.candidateGeneration)
                 return
             }
 

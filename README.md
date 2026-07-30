@@ -18,6 +18,8 @@ last audible tab.
   device, and IOProc.
 - Treats browser helper processes as part of the foreground browser family.
 - Lists foreground window titles and the complete muted app/process list.
+- Offers a persistent switch-delay setting (immediate to 3 seconds).
+- Offers a persistent, directly selectable application whitelist.
 - Shows a build timestamp and live audio-pipeline status in the menu.
 - Chrome and Firefox extensions provide per-tab audible-focus control.
 - Browser HTML audio/video fades over 450 ms before tab mute is applied.

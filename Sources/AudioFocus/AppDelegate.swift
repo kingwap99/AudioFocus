@@ -37,6 +37,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         setupMenuBar()
         audioManager.delegate = self
         foregroundMonitor.delegate = self
+        DistributedNotificationCenter.default().addObserver(
+            self,
+            selector: #selector(browserAudioEvent(_:)),
+            name: SettingsBridge.browserAudioEventNotification,
+            object: nil,
+            suspensionBehavior: .deliverImmediately
+        )
         audioManager.startPolling(interval: 3.0)
         audioManager.muteAllExcept(bundleID: foregroundMonitor.currentForegroundBundleID)
         os_log(.info, log: Self.log, "AudioFocus ready")
@@ -232,8 +239,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func displayName(for process: AudioProcessInfo?) -> String {
         guard let process else { return "Unknown" }
-        if let app = NSRunningApplication(processIdentifier: process.pid),
-           let name = app.localizedName, !name.isEmpty {
+        if let name = process.appName, !name.isEmpty {
             return name
         }
         if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: process.bundleID),
@@ -342,9 +348,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        DistributedNotificationCenter.default().removeObserver(self)
         audioManager.unmuteAll()
         audioManager.stopPolling()
         if let activity { ProcessInfo.processInfo.endActivity(activity) }
+    }
+
+    @objc private func browserAudioEvent(_ notification: Notification) {
+        guard isEnabled,
+              let userInfo = notification.userInfo,
+              let event = userInfo[SettingsBridge.browserAudioEventKey] as? String,
+              let bundleID = userInfo[SettingsBridge.browserBundleIDKey] as? String else { return }
+
+        switch event {
+        case "active":
+            guard foregroundMonitor.currentForegroundBundleID == bundleID else { return }
+            audioManager.considerForegroundCandidate(bundleID: bundleID)
+        case "owner_closed":
+            audioManager.browserOwnerDidClose(bundleID: bundleID)
+        default:
+            break
+        }
     }
 }
 
@@ -354,6 +378,11 @@ extension AppDelegate: ForegroundMonitorDelegate {
         guard isEnabled else { return }
         os_log(.info, log: Self.log, "Foreground → %{public}@", appName ?? "?")
         audioManager.considerForegroundCandidate(bundleID: bundleID)
+    }
+
+    func applicationDidTerminate(bundleID: String?) {
+        guard isEnabled else { return }
+        audioManager.considerOwnerTermination(bundleID: bundleID)
     }
 }
 

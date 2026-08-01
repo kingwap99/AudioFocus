@@ -8,6 +8,9 @@ struct SharedAudioFocusSettings: Codable {
 
 enum SettingsBridge {
     static let nativeHostName = "com.audiofocus.nativehost"
+    static let browserAudioEventNotification = Notification.Name("com.audiofocus.browserAudioEvent")
+    static let browserAudioEventKey = "event"
+    static let browserBundleIDKey = "browserBundleID"
     static let chromeExtensionID = "pijagplcjlcnlgafkcegnbdjkgeoheak"
     static let firefoxExtensionID = "audiofocus-tab-controller@local"
 

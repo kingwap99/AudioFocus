@@ -4,6 +4,7 @@ import os.log
 
 protocol ForegroundMonitorDelegate: AnyObject {
     func foregroundAppDidChange(bundleID: String?, appName: String?, pid: pid_t)
+    func applicationDidTerminate(bundleID: String?)
 }
 
 final class ForegroundMonitor {
@@ -20,11 +21,20 @@ final class ForegroundMonitor {
             self, selector: #selector(onChange(_:)),
             name: NSWorkspace.didActivateApplicationNotification, object: nil
         )
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self, selector: #selector(onTerminate(_:)),
+            name: NSWorkspace.didTerminateApplicationNotification, object: nil
+        )
     }
 
     @objc private func onChange(_ n: Notification) {
         guard let app = n.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
         update(app)
+    }
+
+    @objc private func onTerminate(_ n: Notification) {
+        guard let app = n.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
+        delegate?.applicationDidTerminate(bundleID: app.bundleIdentifier)
     }
 
     private func update(_ app: NSRunningApplication) {

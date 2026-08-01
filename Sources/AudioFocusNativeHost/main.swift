@@ -1,3 +1,5 @@
+import AppKit
+import Darwin
 import Foundation
 
 struct SharedSettings: Codable {
@@ -8,6 +10,7 @@ struct SharedSettings: Codable {
 
 struct NativeRequest: Decodable {
     let type: String
+    let browserBundleID: String?
 }
 
 let input = FileHandle.standardInput
@@ -25,6 +28,27 @@ func loadSettings() -> SharedSettings {
         return SharedSettings(version: 1, switchDelay: 0.5, whitelistBundleIDs: [])
     }
     return settings
+}
+
+func audioFocusIsRunning() -> Bool {
+    !NSRunningApplication.runningApplications(
+        withBundleIdentifier: "com.audiofocus.app"
+    ).isEmpty
+}
+
+func reportBrowserEvent(_ type: String, bundleID: String?) {
+    let allowedBundleIDs: Set<String> = ["com.google.Chrome", "org.mozilla.firefox"]
+    guard audioFocusIsRunning(),
+          let bundleID,
+          allowedBundleIDs.contains(bundleID),
+          ["active", "owner_closed"].contains(type) else { return }
+
+    DistributedNotificationCenter.default().postNotificationName(
+        Notification.Name("com.audiofocus.browserAudioEvent"),
+        object: nil,
+        userInfo: ["event": type, "browserBundleID": bundleID],
+        deliverImmediately: true
+    )
 }
 
 func readExactly(_ count: Int) -> Data? {
@@ -59,14 +83,23 @@ while let lengthData = readExactly(4) {
     switch request.type {
     case "get_config":
         let settings = loadSettings()
+        let appRunning = audioFocusIsRunning()
         send([
             "type": "config",
             "version": settings.version,
             "switchDelay": settings.switchDelay,
-            "whitelistBundleIDs": settings.whitelistBundleIDs
+            "whitelistBundleIDs": settings.whitelistBundleIDs,
+            "appRunning": appRunning
         ])
+        if !appRunning { exit(EXIT_SUCCESS) }
     case "ping":
         send(["type": "pong"])
+    case "browser_owner_active":
+        reportBrowserEvent("active", bundleID: request.browserBundleID)
+        send(["type": "ack"])
+    case "browser_owner_closed":
+        reportBrowserEvent("owner_closed", bundleID: request.browserBundleID)
+        send(["type": "ack"])
     default:
         send(["type": "error", "message": "unsupported request"])
     }

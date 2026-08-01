@@ -81,8 +81,11 @@ echo "APPL????" > "$BUNDLE_DIR/Contents/PkgInfo"
 # Ad-hoc signing makes local development builds launchable without requiring a
 # personal Apple Development identity. Distribution builds should be signed and
 # notarized with the publisher's own credentials.
-xattr -d com.apple.FinderInfo "$BUNDLE_DIR" 2>/dev/null || true
+# Existing local bundles can inherit Finder/resource-fork metadata when replaced.
+# Remove it recursively before signing or strict signature verification will fail.
+xattr -cr "$BUNDLE_DIR"
 codesign --force --deep --sign - --timestamp=none "$BUNDLE_DIR"
+xattr -d com.apple.FinderInfo "$BUNDLE_DIR" 2>/dev/null || true
 
 echo ""
 echo "=== Build Complete ==="

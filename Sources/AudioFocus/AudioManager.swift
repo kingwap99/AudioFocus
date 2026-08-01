@@ -17,6 +17,22 @@ protocol AudioManagerDelegate: AnyObject {
     func audioManagerDidChangeStatus(_ status: String)
 }
 
+/// All state-changing inputs funnel through this event type so ownership,
+/// candidate, and recovery transitions stay on one serialized path.
+private enum AudioEvent {
+    case foregroundCandidate
+    case recheckSilentCandidate(remainingAttempts: Int)
+    case completeCandidateSwitch
+    case ownerTerminated
+    case browserOwnerActive
+    case browserOwnerClosed
+    case muteAllExcept
+    case switchDelayChanged
+    case whitelistChanged
+    case poll
+    case unmuteAll
+}
+
 @available(macOS 14.2, *)
 final class AudioManager {
     private static let log = OSLog(subsystem: "com.audiofocus.app", category: "AudioManager")
@@ -36,6 +52,10 @@ final class AudioManager {
     private var scheduledGeneration: Int?
     private var recentForegroundBundleIDs: [String] = []
     private var audibleOwnerHistory: [String] = []
+    private var silentRecheckRemaining = 0
+    private var pendingEventBundleID: String?
+    private var terminatedEventBundleID: String?
+    private var browserEventBundleID: String?
 
     private let ownerCloseDebounce: TimeInterval = 0.25
     private let silentCandidateRecheckInterval: TimeInterval = 0.25
@@ -329,91 +349,216 @@ final class AudioManager {
 
     // MARK: - Public API
 
-    /// Changes audio ownership only when the newly focused app is actually outputting audio.
-    /// A silent window remains pending while the previous audible owner keeps playing.
-    func considerForegroundCandidate(bundleID: String?) {
+    private func dispatch(_ event: AudioEvent) {
         controlQueue.async { [weak self] in
-            guard let self, let bundleID, !bundleID.isEmpty else { return }
-            self.rememberForeground(bundleID)
-            self.pendingForegroundBundleID = bundleID
-            self.candidateGeneration += 1
-            self.scheduledGeneration = nil
-            let all = self.getAudioProcesses()
+            self?.handle(event)
+        }
+    }
 
-            if self.currentFocusBundleID == nil || self.familyIsOutputting(bundleID, in: all) {
-                self.scheduleCandidate(bundleID, generation: self.candidateGeneration)
-            } else {
-                let owner = self.currentFocusBundleID ?? "none"
-                self.updateStatus("Holding \(owner); front window is silent")
-                self.scheduleInactiveOwnerRecovery(generation: self.candidateGeneration)
-                self.scheduleSilentCandidateRecheck(
-                    bundleID,
-                    generation: self.candidateGeneration,
-                    remainingAttempts: self.silentCandidateRecheckAttempts
-                )
+    /// Single serialized entry point for all state transitions.
+    ///
+    /// Every timer callback and every public API funnels through here, so the
+    /// ownership, candidate, and recovery state machines cannot interleave.
+    private func handle(_ event: AudioEvent) {
+        switch event {
+        case .foregroundCandidate:
+            considerForegroundCandidateNow()
+
+        case .recheckSilentCandidate(let remainingAttempts):
+            guard let pending = pendingForegroundBundleID else { return }
+            let latest = getAudioProcesses()
+            if familyIsOutputting(pending, in: latest) {
+                scheduleCandidate(pending, generation: candidateGeneration)
+                return
+            }
+            guard remainingAttempts > 1 else {
+                silentRecheckRemaining = 0
+                return
+            }
+            silentRecheckRemaining = remainingAttempts - 1
+            scheduleSilentCandidateRecheck(
+                generation: candidateGeneration,
+                remainingAttempts: silentRecheckRemaining
+            )
+
+        case .completeCandidateSwitch:
+            guard let bundleID = pendingForegroundBundleID,
+                  scheduledGeneration == candidateGeneration,
+                  familyIsOutputting(bundleID, in: getAudioProcesses()) else {
+                let owner = currentFocusBundleID ?? "none"
+                updateStatus("Holding \(owner); candidate became silent")
+                return
+            }
+            scheduledGeneration = nil
+            applyFocus(bundleID)
+
+        case .ownerTerminated:
+            recoverForTerminatedOwner()
+
+        case .browserOwnerActive:
+            considerForegroundCandidateNow()
+
+        case .browserOwnerClosed:
+            guard let bundleID = browserEventBundleID,
+                  let owner = currentFocusBundleID,
+                  isSameFamily(bundleID, owner) else { return }
+
+            candidateGeneration += 1
+            scheduledGeneration = nil
+            silentRecheckRemaining = 0
+            audibleOwnerHistory.removeAll { isSameFamily($0, bundleID) }
+            let all = getAudioProcesses()
+
+            guard let previousOwner = audibleOwnerHistory.reversed().first(where: {
+                familyExists($0, in: all)
+            }) else {
+                currentFocusBundleID = nil
+                pendingForegroundBundleID = bundleID
+                let muted = mutedProcesses(from: all, foreground: nil)
+                _ = createPipeline(for: muted)
+                updateStatus("Browser owner closed; waiting for audible foreground")
+                DispatchQueue.main.async { [weak self] in
+                    self?.delegate?.audioManagerDidUpdateProcessList(muted)
+                }
+                return
+            }
+
+            pendingForegroundBundleID = bundleID
+            applyFocus(previousOwner, allProcesses: all, preservePending: true)
+            updateStatus("Browser owner closed; restored \(previousOwner)")
+
+        case .muteAllExcept:
+            guard let bundleID = pendingEventBundleID ?? pendingForegroundBundleID,
+                  !bundleID.isEmpty else { return }
+            pendingForegroundBundleID = bundleID
+            rememberForeground(bundleID)
+            applyFocus(bundleID)
+
+        case .switchDelayChanged:
+            break
+
+        case .whitelistChanged:
+            guard let focus = currentFocusBundleID else { return }
+            applyFocus(focus)
+
+        case .poll:
+            let all = getAudioProcesses()
+
+            if let pending = pendingForegroundBundleID,
+               familyIsOutputting(pending, in: all) {
+                scheduleCandidate(pending, generation: candidateGeneration)
+                return
+            }
+
+            guard let focus = currentFocusBundleID else { return }
+            if !familyIsOutputting(focus, in: all) {
+                recoverFromPoll(owner: focus, processes: all)
+            }
+            let muted = mutedProcesses(from: all, foreground: focus)
+            let newIDs = Set(muted.map(\.objectID))
+            if newIDs != mutedObjectIDs {
+                _ = createPipeline(for: muted)
+                DispatchQueue.main.async { [weak self] in
+                    self?.delegate?.audioManagerDidUpdateProcessList(muted)
+                }
+            }
+
+        case .unmuteAll:
+            destroyPipeline()
+            updateStatus("Paused")
+            DispatchQueue.main.async { [weak self] in
+                self?.delegate?.audioManagerDidUpdateProcessList([])
             }
         }
     }
 
+    /// Changes audio ownership only when the newly focused app is actually outputting audio.
+    /// A silent window remains pending while the previous audible owner keeps playing.
+    func considerForegroundCandidate(bundleID: String?) {
+        guard let bundleID, !bundleID.isEmpty else { return }
+        pendingForegroundBundleID = bundleID
+        dispatch(.foregroundCandidate)
+    }
+
     private func scheduleSilentCandidateRecheck(
-        _ bundleID: String,
         generation: Int,
         remainingAttempts: Int
     ) {
         guard remainingAttempts > 0 else { return }
         controlQueue.asyncAfter(deadline: .now() + silentCandidateRecheckInterval) { [weak self] in
-            guard let self,
-                  self.candidateGeneration == generation,
-                  self.pendingForegroundBundleID == bundleID else { return }
-
-            let latest = self.getAudioProcesses()
-            if self.familyIsOutputting(bundleID, in: latest) {
-                self.scheduleCandidate(bundleID, generation: generation)
-                return
-            }
-
-            self.scheduleSilentCandidateRecheck(
-                bundleID,
-                generation: generation,
-                remainingAttempts: remainingAttempts - 1
-            )
+            guard let self, self.candidateGeneration == generation else { return }
+            self.dispatch(.recheckSilentCandidate(remainingAttempts: remainingAttempts))
         }
     }
 
     private func scheduleInactiveOwnerRecovery(generation: Int, force: Bool = false) {
         controlQueue.asyncAfter(deadline: .now() + ownerCloseDebounce) { [weak self] in
             guard let self, self.candidateGeneration == generation else { return }
-            self.recoverFromInactiveOwner(generation: generation, force: force)
+            self.runInactiveOwnerRecovery(generation: generation, force: force)
         }
     }
 
-    private func recoveryCandidate(
-        excluding owner: String,
-        in processes: [AudioProcessInfo]
-    ) -> String? {
-        if let pending = pendingForegroundBundleID,
-           pending != owner,
-           familyIsOutputting(pending, in: processes) {
-            return pending
-        }
+    private func considerForegroundCandidateNow() {
+        guard let bundleID = pendingEventBundleID ?? pendingForegroundBundleID,
+              !bundleID.isEmpty else { return }
+        pendingForegroundBundleID = bundleID
+        rememberForeground(bundleID)
+        candidateGeneration += 1
+        scheduledGeneration = nil
+        silentRecheckRemaining = 0
+        let all = getAudioProcesses()
 
-        return recentForegroundBundleIDs.first {
-            $0 != owner
-                && !protectedBundleIDs.contains($0)
-                && !isWhitelistedFamily($0)
-                && familyIsOutputting($0, in: processes)
+        if currentFocusBundleID == nil || familyIsOutputting(bundleID, in: all) {
+            scheduleCandidate(bundleID, generation: candidateGeneration)
+        } else {
+            let owner = currentFocusBundleID ?? "none"
+            updateStatus("Holding \(owner); front window is silent")
+            scheduleInactiveOwnerRecovery(generation: candidateGeneration)
+            silentRecheckRemaining = silentCandidateRecheckAttempts
+            scheduleSilentCandidateRecheck(
+                generation: candidateGeneration,
+                remainingAttempts: silentRecheckRemaining
+            )
         }
     }
 
-    private func recoverFromInactiveOwner(
+    private func recoverForTerminatedOwner() {
+        guard let owner = currentFocusBundleID,
+              let terminatedBundleID = terminatedEventBundleID,
+              isSameFamily(terminatedBundleID, owner) else { return }
+        let all = getAudioProcesses()
+        guard !familyIsOutputting(owner, in: all) else { return }
+        runInactiveOwnerRecovery(generation: candidateGeneration, force: true)
+    }
+
+    private func recoverFromPoll(owner: String, processes: [AudioProcessInfo]) {
+        guard !familyIsOutputting(owner, in: processes) else { return }
+
+        if let terminatedBundleID = terminatedEventBundleID,
+           !isSameFamily(terminatedBundleID, owner) {
+            return
+        }
+        let foregroundMovedAway = pendingForegroundBundleID.map { $0 != owner } ?? false
+        guard !familyExists(owner, in: processes) || foregroundMovedAway else {
+            // Browsers briefly stop output while navigating. Keep their process
+            // family excluded from the mute pipeline until it resumes.
+            return
+        }
+
+        let savedFocus = owner
+        runInactiveOwnerRecovery(generation: candidateGeneration, processes: processes)
+        guard currentFocusBundleID == savedFocus else { return }
+    }
+
+    private func runInactiveOwnerRecovery(
         generation: Int,
-        allProcesses: [AudioProcessInfo]? = nil,
+        processes: [AudioProcessInfo]? = nil,
         force: Bool = false
     ) {
         guard candidateGeneration == generation,
               let owner = currentFocusBundleID else { return }
 
-        let all = allProcesses ?? getAudioProcesses()
+        let all = processes ?? getAudioProcesses()
         guard !familyIsOutputting(owner, in: all) else { return }
         let foregroundMovedAway = pendingForegroundBundleID.map { $0 != owner } ?? false
         guard force || !familyExists(owner, in: all) || foregroundMovedAway else {
@@ -439,6 +584,24 @@ final class AudioManager {
         }
     }
 
+    private func recoveryCandidate(
+        excluding owner: String,
+        in processes: [AudioProcessInfo]
+    ) -> String? {
+        if let pending = pendingForegroundBundleID,
+           pending != owner,
+           familyIsOutputting(pending, in: processes) {
+            return pending
+        }
+
+        return recentForegroundBundleIDs.first {
+            $0 != owner
+                && !protectedBundleIDs.contains($0)
+                && !isWhitelistedFamily($0)
+                && familyIsOutputting($0, in: processes)
+        }
+    }
+
     private func scheduleCandidate(_ bundleID: String, generation: Int) {
         guard scheduledGeneration != generation else { return }
         scheduledGeneration = generation
@@ -451,15 +614,7 @@ final class AudioManager {
             guard let self,
                   self.candidateGeneration == generation,
                   self.pendingForegroundBundleID == bundleID else { return }
-            self.scheduledGeneration = nil
-
-            let latest = self.getAudioProcesses()
-            guard self.currentFocusBundleID == nil || self.familyIsOutputting(bundleID, in: latest) else {
-                let owner = self.currentFocusBundleID ?? "none"
-                self.updateStatus("Holding \(owner); candidate became silent")
-                return
-            }
-            self.applyFocus(bundleID, allProcesses: latest)
+            self.dispatch(.completeCandidateSwitch)
         }
     }
 
@@ -485,82 +640,37 @@ final class AudioManager {
     }
 
     func muteAllExcept(bundleID: String?) {
-        controlQueue.async { [weak self] in
-            guard let self, let bundleID, !bundleID.isEmpty else { return }
-            self.rememberForeground(bundleID)
-            self.applyFocus(bundleID)
-        }
+        guard let bundleID, !bundleID.isEmpty else { return }
+        pendingForegroundBundleID = bundleID
+        dispatch(.muteAllExcept)
     }
 
     func considerOwnerTermination(bundleID: String?) {
-        controlQueue.async { [weak self] in
-            guard let self,
-                  let bundleID,
-                  let owner = self.currentFocusBundleID,
-                  self.isSameFamily(bundleID, owner) else { return }
-            self.candidateGeneration += 1
-            self.scheduledGeneration = nil
-            self.scheduleInactiveOwnerRecovery(generation: self.candidateGeneration, force: true)
-        }
+        guard let bundleID else { return }
+        terminatedEventBundleID = bundleID
+        dispatch(.ownerTerminated)
     }
 
     /// Restores the prior audible app after a browser confirms that its owner tab
     /// closed and the replacement active tab is still silent.
     func browserOwnerDidClose(bundleID: String?) {
-        controlQueue.async { [weak self] in
-            guard let self,
-                  let bundleID,
-                  let owner = self.currentFocusBundleID,
-                  self.isSameFamily(bundleID, owner) else { return }
-
-            self.candidateGeneration += 1
-            self.scheduledGeneration = nil
-            self.audibleOwnerHistory.removeAll { self.isSameFamily($0, bundleID) }
-            let all = self.getAudioProcesses()
-
-            guard let previousOwner = self.audibleOwnerHistory.reversed().first(where: {
-                self.familyExists($0, in: all)
-            }) else {
-                self.currentFocusBundleID = nil
-                self.pendingForegroundBundleID = bundleID
-                let muted = self.mutedProcesses(from: all, foreground: nil)
-                _ = self.createPipeline(for: muted)
-                self.updateStatus("Browser owner closed; waiting for audible foreground")
-                DispatchQueue.main.async { [weak self] in
-                    self?.delegate?.audioManagerDidUpdateProcessList(muted)
-                }
-                return
-            }
-
-            self.pendingForegroundBundleID = bundleID
-            self.applyFocus(previousOwner, allProcesses: all, preservePending: true)
-            self.updateStatus("Browser owner closed; restored \(previousOwner)")
-        }
+        guard let bundleID else { return }
+        browserEventBundleID = bundleID
+        dispatch(.browserOwnerClosed)
     }
 
     func setSwitchDelay(_ delay: TimeInterval) {
-        controlQueue.async { [weak self] in
-            self?.switchDelay = max(0, delay)
-        }
+        switchDelay = max(0, delay)
+        dispatch(.switchDelayChanged)
     }
 
     func setWhitelist(_ bundleIDs: Set<String>) {
-        controlQueue.async { [weak self] in
-            guard let self else { return }
-            self.whitelistBundleIDs = bundleIDs
-            guard let focus = self.currentFocusBundleID else { return }
-            self.applyFocus(focus)
-        }
+        whitelistBundleIDs = bundleIDs
+        dispatch(.whitelistChanged)
     }
 
     func unmuteAll() {
-        controlQueue.sync {
-            destroyPipeline()
-        }
-        updateStatus("Paused")
-        DispatchQueue.main.async { [weak self] in
-            self?.delegate?.audioManagerDidUpdateProcessList([])
-        }
+        dispatch(.unmuteAll)
     }
 
     // MARK: - Polling
@@ -570,30 +680,7 @@ final class AudioManager {
         pollTimer?.schedule(deadline: .now() + interval, repeating: interval)
         pollTimer?.setEventHandler { [weak self] in
             guard let self else { return }
-            let all = self.getAudioProcesses()
-
-            if let pending = self.pendingForegroundBundleID,
-               self.familyIsOutputting(pending, in: all) {
-                self.scheduleCandidate(pending, generation: self.candidateGeneration)
-                return
-            }
-
-            guard let focus = self.currentFocusBundleID else { return }
-            if !self.familyIsOutputting(focus, in: all) {
-                self.recoverFromInactiveOwner(
-                    generation: self.candidateGeneration,
-                    allProcesses: all
-                )
-                guard self.currentFocusBundleID == focus else { return }
-            }
-            let muted = self.mutedProcesses(from: all, foreground: focus)
-            let newIDs = Set(muted.map(\.objectID))
-            if newIDs != self.mutedObjectIDs {
-                _ = self.createPipeline(for: muted)
-                DispatchQueue.main.async { [weak self] in
-                    self?.delegate?.audioManagerDidUpdateProcessList(muted)
-                }
-            }
+            self.dispatch(.poll)
         }
         pollTimer?.resume()
     }

@@ -1,21 +1,12 @@
 const NATIVE_HOST = "com.audiofocus.nativehost";
 const BROWSER_BUNDLE_ID = "com.google.Chrome";
 const FADE_MS = 450;
-const OWNER_CLOSE_DEBOUNCE_MS = 250;
-const OWNER_RECOVERY_ATTEMPTS = 8;
-const FALLBACK_AUDIBLE_GRACE_MS = 15000;
 const RUNNING_RECONNECT_MS = 2000;
 const STOPPED_RECONNECT_MS = 5000;
-let switchDelayMs = 500;
 let controllerEnabled = false;
-let ownerTabId = null;
-let switchSerial = 0;
-let candidateSerial = 0;
-let recoverySerial = 0;
 let nativePort = null;
 let configTimer = null;
 let reconnectTimer = null;
-let reportedOwnerCloseSerial = null;
 const managedTabs = new Set();
 const tabsToRestore = new Set();
 const tabActivity = new Map();
@@ -30,12 +21,6 @@ function noteTabActivity(tab, focused = false) {
 
 function requestConfig() {
   try { nativePort?.postMessage({ type: "get_config" }); } catch (_) {}
-}
-
-function reportBrowserAudioEvent(type) {
-  try {
-    nativePort?.postMessage({ type, browserBundleID: BROWSER_BUNDLE_ID });
-  } catch (_) {}
 }
 
 function stopConfigPolling() {
@@ -61,10 +46,6 @@ function closeNativePort() {
 async function disableController() {
   if (!controllerEnabled && !tabsToRestore.size) return;
   controllerEnabled = false;
-  candidateSerial++;
-  switchSerial++;
-  recoverySerial++;
-  ownerTabId = null;
 
   const restoreTabIDs = [...tabsToRestore];
   tabsToRestore.clear();
@@ -79,10 +60,7 @@ async function disableController() {
 async function enableController() {
   if (controllerEnabled) return;
   controllerEnabled = true;
-  const tabs = await chrome.tabs.query({ audible: true });
-  if (!tabs.length) return;
-  tabs.sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0));
-  await considerTab(tabs.find(tab => tab.active) || tabs[0]);
+  await sendTabState();
 }
 
 function connectNativeHost() {
@@ -91,21 +69,16 @@ function connectNativeHost() {
     const port = chrome.runtime.connectNative(NATIVE_HOST);
     nativePort = port;
     port.onMessage.addListener(async (message) => {
-      if (message?.type !== "config") return;
-      if (message.appRunning !== true) {
-        await disableController();
-        if (nativePort === port) closeNativePort();
-        scheduleNativeReconnect(STOPPED_RECONNECT_MS);
-        return;
-      }
-
-      await enableController();
-      const nextDelay = Math.max(0, Number(message.switchDelay) || 0) * 1000;
-      if (nextDelay !== switchDelayMs) {
-        switchDelayMs = nextDelay;
-        candidateSerial++;
-        const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-        await considerTab(tab);
+      if (message?.type === "config") {
+        if (message.appRunning !== true) {
+          await disableController();
+          if (nativePort === port) closeNativePort();
+          scheduleNativeReconnect(STOPPED_RECONNECT_MS);
+          return;
+        }
+        await enableController();
+      } else if (message?.type === "state_command") {
+        await applyStateCommand(message);
       }
     });
     port.onDisconnect.addListener(() => {
@@ -140,13 +113,12 @@ async function sendFade(tabId, direction) {
   }
 }
 
-async function fadeOutAndMute(tabId, serial) {
-  if (!controllerEnabled || !tabId || tabId === ownerTabId) return;
+async function fadeOutAndMute(tabId) {
+  if (!controllerEnabled || !tabId) return;
   managedTabs.add(tabId);
   tabsToRestore.add(tabId);
   await sendFade(tabId, "out");
   setTimeout(async () => {
-    if (!controllerEnabled || serial !== switchSerial || tabId === ownerTabId) return;
     try { await chrome.tabs.update(tabId, { muted: true }); } catch (_) {}
   }, FADE_MS);
 }
@@ -157,64 +129,6 @@ async function fadeIn(tabId) {
   try { await chrome.tabs.update(tabId, { muted: false }); } catch (_) { return; }
   await sendFade(tabId, "in");
   tabsToRestore.delete(tabId);
-}
-
-async function switchOwner(tab) {
-  if (!controllerEnabled || !tab?.id || tab.id === ownerTabId) return;
-  recoverySerial++;
-  const serial = ++switchSerial;
-  const previous = ownerTabId;
-  ownerTabId = tab.id;
-
-  await fadeIn(tab.id);
-  reportBrowserAudioEvent("browser_owner_active");
-  if (previous) await fadeOutAndMute(previous, serial);
-
-  const tabs = await chrome.tabs.query({});
-  for (const other of tabs) {
-    if (other.id !== ownerTabId && (other.audible || managedTabs.has(other.id))) {
-      await fadeOutAndMute(other.id, serial);
-    }
-  }
-}
-
-async function candidateIsPlaying(tab) {
-  if (!tab?.id) return false;
-  if (tab.audible) {
-    noteTabActivity(tab);
-    return true;
-  }
-  if (!managedTabs.has(tab.id)) return false;
-  return await mediaIsPlaying(tab.id) === true;
-}
-
-async function considerTab(tab, restoreExistingOwner = false) {
-  const serial = ++candidateSerial;
-  if (!controllerEnabled || !tab?.id || !tab.active) return;
-
-  try {
-    const window = await chrome.windows.get(tab.windowId);
-    if (!window.focused) return;
-  } catch (_) { return; }
-
-  noteTabActivity(tab, true);
-  if (!await candidateIsPlaying(tab)) return;
-  if (restoreExistingOwner && tab.id === ownerTabId) {
-    await fadeIn(tab.id);
-    reportBrowserAudioEvent("browser_owner_active");
-    return;
-  }
-
-  setTimeout(async () => {
-    if (!controllerEnabled || serial !== candidateSerial) return;
-    try {
-      const latest = await chrome.tabs.get(tab.id);
-      const window = await chrome.windows.get(latest.windowId);
-      if (latest.active && window.focused && await candidateIsPlaying(latest)) {
-        await switchOwner(latest);
-      }
-    } catch (_) {}
-  }, switchDelayMs);
 }
 
 async function mediaIsPlaying(tabId) {
@@ -245,110 +159,108 @@ async function mediaIsPlaying(tabId) {
   }
 }
 
-async function isFallbackCandidate(tab) {
-  if (!tab?.id) return false;
-  if (tab.audible) {
-    noteTabActivity(tab);
-    return true;
+async function buildTabSnapshot() {
+  const [activeWindow] = await chrome.windows.getAll({ populate: true, windowTypes: ["normal"] });
+  const tabs = activeWindow?.tabs ?? [];
+  const activeTab = tabs.find(tab => tab.active) || tabs[0] || null;
+  const windowFocused = Boolean(activeWindow?.focused);
+
+  for (const tab of tabs) {
+    noteTabActivity(tab, tab.id === activeTab?.id);
   }
 
-  const playing = await mediaIsPlaying(tab.id);
-  if (playing !== null) return playing;
+  const snapshotTabs = await Promise.all(tabs.map(async (tab) => {
+    const activity = tabActivity.get(tab.id) || { lastAudibleAt: 0, lastFocusedAt: 0 };
+    const playing = tab.audible ? null : await mediaIsPlaying(tab.id);
+    return {
+      id: tab.id,
+      audible: tab.audible,
+      muted: tab.mutedInfo?.muted ?? false,
+      playing,
+      lastFocusedAt: activity.lastFocusedAt || 0,
+      lastAudibleAt: activity.lastAudibleAt || 0
+    };
+  }));
 
-  const activity = tabActivity.get(tab.id);
-  return managedTabs.has(tab.id)
-    && Boolean(activity?.lastAudibleAt)
-    && Date.now() - activity.lastAudibleAt <= FALLBACK_AUDIBLE_GRACE_MS;
+  return {
+    type: "tab_state",
+    browserBundleID: BROWSER_BUNDLE_ID,
+    contextID: "default",
+    activeTabID: activeTab?.id ?? -1,
+    windowFocused,
+    tabs: snapshotTabs
+  };
 }
 
-async function recoverClosedOwner(serial, remainingAttempts) {
-  if (!controllerEnabled || serial !== recoverySerial || ownerTabId !== null) return;
-
+async function sendTabState() {
+  if (!controllerEnabled || !nativePort) return;
   try {
-    const [foreground] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-    if (foreground) {
-      const window = await chrome.windows.get(foreground.windowId);
-      noteTabActivity(foreground, window.focused);
-      if (window.focused && await isFallbackCandidate(foreground)) {
-        await switchOwner(foreground);
-        return;
+    nativePort.postMessage(await buildTabSnapshot());
+  } catch (_) {}
+}
+
+async function applyStateCommand(message) {
+  if (!controllerEnabled) return;
+  if (message.muteAll === true) {
+    const tabs = await chrome.tabs.query({});
+    for (const tab of tabs) {
+      if (tab.audible || managedTabs.has(tab.id)) {
+        await fadeOutAndMute(tab.id);
       }
     }
-  } catch (_) {}
-
-  if (reportedOwnerCloseSerial !== serial) {
-    reportedOwnerCloseSerial = serial;
-    reportBrowserAudioEvent("browser_owner_closed");
+    return;
   }
 
-  if (remainingAttempts > 1) {
-    setTimeout(
-      () => recoverClosedOwner(serial, remainingAttempts - 1),
-      OWNER_CLOSE_DEBOUNCE_MS
-    );
+  for (const action of message.actions ?? []) {
+    if (action.kind === "unmute") {
+      await fadeIn(action.tabID);
+    } else if (action.kind === "mute") {
+      await fadeOutAndMute(action.tabID);
+    }
   }
 }
 
-function scheduleOwnerRecovery() {
-  const serial = ++recoverySerial;
-  setTimeout(
-    () => recoverClosedOwner(serial, OWNER_RECOVERY_ATTEMPTS),
-    OWNER_CLOSE_DEBOUNCE_MS
-  );
-}
-
-async function muteBrowserForBackground() {
-  candidateSerial++;
-  recoverySerial++;
-  const serial = ++switchSerial;
-  ownerTabId = null;
-
+async function muteAllLocally() {
   const tabs = await chrome.tabs.query({});
   for (const tab of tabs) {
     if (tab.audible || managedTabs.has(tab.id)) {
-      await fadeOutAndMute(tab.id, serial);
+      await fadeOutAndMute(tab.id);
     }
   }
 }
 
-chrome.tabs.onActivated.addListener(async ({ tabId }) => {
+chrome.tabs.onActivated.addListener(async () => {
   if (!controllerEnabled) return;
-  try { await considerTab(await chrome.tabs.get(tabId), true); } catch (_) {}
+  await sendTabState();
 });
 
 chrome.tabs.onUpdated.addListener(async (_tabId, changeInfo, tab) => {
   if (!controllerEnabled) return;
-  if (changeInfo.audible === true || (tab.active && tab.audible)) {
+  if (changeInfo.audible !== undefined || changeInfo.mutedInfo !== undefined || (tab.active && tab.audible)) {
     noteTabActivity(tab);
-    await considerTab(tab);
+    await sendTabState();
   }
 });
 
 chrome.windows.onFocusChanged.addListener(async (windowId) => {
   if (!controllerEnabled) return;
   if (windowId === chrome.windows.WINDOW_ID_NONE) {
-    await muteBrowserForBackground();
+    await muteAllLocally();
     return;
   }
-  candidateSerial++;
-  const [tab] = await chrome.tabs.query({ active: true, windowId });
-  await considerTab(tab, true);
+  await sendTabState();
 });
 
-chrome.tabs.onRemoved.addListener((tabId) => {
-  const wasOwner = ownerTabId === tabId;
+chrome.tabs.onRemoved.addListener(async (tabId) => {
   managedTabs.delete(tabId);
   tabsToRestore.delete(tabId);
   tabActivity.delete(tabId);
-  if (!wasOwner) return;
-  ownerTabId = null;
-  candidateSerial++;
-  switchSerial++;
-  scheduleOwnerRecovery();
+  if (controllerEnabled) await sendTabState();
 });
 
 async function initialize() {
   connectNativeHost();
+  setInterval(() => sendTabState(), 1000);
 }
 
 initialize();

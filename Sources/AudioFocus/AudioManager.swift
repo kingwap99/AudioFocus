@@ -17,6 +17,22 @@ protocol AudioManagerDelegate: AnyObject {
     func audioManagerDidChangeStatus(_ status: String)
 }
 
+struct TabSnapshot: Decodable {
+    struct Tab: Decodable {
+        let id: Int
+        let audible: Bool?
+        let muted: Bool?
+        let playing: Bool?
+        let lastFocusedAt: Double?
+        let lastAudibleAt: Double?
+    }
+    let browserBundleID: String
+    let contextID: String
+    let activeTabID: Int?
+    let windowFocused: Bool
+    let tabs: [Tab]?
+}
+
 /// All state-changing inputs funnel through this event type so ownership,
 /// candidate, and recovery transitions stay on one serialized path.
 private enum AudioEvent {
@@ -56,6 +72,13 @@ final class AudioManager {
     private var pendingEventBundleID: String?
     private var terminatedEventBundleID: String?
     private var browserEventBundleID: String?
+    private var tabContextStates: [String: TabContextState] = [:]
+
+    private struct TabContextState {
+        var ownerTabID: Int?
+        var pendingTabID: Int?
+        var pendingAt: Date?
+    }
 
     private let ownerCloseDebounce: TimeInterval = 0.25
     private let silentCandidateRecheckInterval: TimeInterval = 0.25
@@ -667,6 +690,84 @@ final class AudioManager {
     func setWhitelist(_ bundleIDs: Set<String>) {
         whitelistBundleIDs = bundleIDs
         dispatch(.whitelistChanged)
+    }
+
+    /// Evaluates a browser tab snapshot and returns a `state_command` payload
+    /// for the extension to apply. Runs on the control queue.
+    func evaluateTabState(_ snapshot: TabSnapshot) -> [String: Any] {
+        var result: [String: Any] = [:]
+        controlQueue.sync {
+            result = evaluateTabStateOnQueue(snapshot)
+        }
+        return result
+    }
+
+    private func evaluateTabStateOnQueue(_ snapshot: TabSnapshot) -> [String: Any] {
+        var command: [String: Any] = [
+            "type": "state_command",
+            "contextID": snapshot.contextID
+        ]
+        var context = tabContextStates[snapshot.contextID] ?? TabContextState()
+
+        let browserIsOwner = currentFocusBundleID.map {
+            isSameFamily(snapshot.browserBundleID, $0)
+        } ?? false
+        let foregroundIsBrowser = (pendingEventBundleID ?? pendingForegroundBundleID).map {
+            isSameFamily(snapshot.browserBundleID, $0)
+        } ?? false
+
+        guard browserIsOwner || foregroundIsBrowser, snapshot.windowFocused else {
+            context.ownerTabID = nil
+            context.pendingTabID = nil
+            context.pendingAt = nil
+            tabContextStates[snapshot.contextID] = context
+            command["muteAll"] = true
+            return command
+        }
+
+        guard let activeTabID = snapshot.activeTabID else {
+            command["muteAll"] = true
+            return command
+        }
+        let activeTab = snapshot.tabs?.first { $0.id == activeTabID }
+        let activeTabIsPlaying = activeTab?.audible == true || activeTab?.playing == true
+
+        guard activeTabIsPlaying else {
+            context.ownerTabID = nil
+            context.pendingTabID = nil
+            context.pendingAt = nil
+            tabContextStates[snapshot.contextID] = context
+            command["muteAll"] = true
+            return command
+        }
+
+        if context.ownerTabID == activeTabID {
+            command["actions"] = [
+                ["kind": "unmute", "tabID": activeTabID, "fade": true]
+            ]
+            return command
+        }
+
+        if context.pendingTabID == activeTabID,
+           let pendingAt = context.pendingAt,
+           Date().timeIntervalSince(pendingAt) >= switchDelay {
+            context.ownerTabID = activeTabID
+            context.pendingTabID = nil
+            context.pendingAt = nil
+            tabContextStates[snapshot.contextID] = context
+            command["actions"] = [
+                ["kind": "unmute", "tabID": activeTabID, "fade": true]
+            ]
+            return command
+        }
+
+        if context.pendingTabID != activeTabID {
+            context.pendingTabID = activeTabID
+            context.pendingAt = Date()
+            tabContextStates[snapshot.contextID] = context
+        }
+        command["muteAll"] = true
+        return command
     }
 
     func unmuteAll() {

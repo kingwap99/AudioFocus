@@ -44,6 +44,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             object: nil,
             suspensionBehavior: .deliverImmediately
         )
+        DistributedNotificationCenter.default().addObserver(
+            self,
+            selector: #selector(tabStateEvent(_:)),
+            name: SettingsBridge.tabStateNotification,
+            object: nil,
+            suspensionBehavior: .deliverImmediately
+        )
         audioManager.startPolling(interval: 3.0)
         audioManager.muteAllExcept(bundleID: foregroundMonitor.currentForegroundBundleID)
         os_log(.info, log: Self.log, "AudioFocus ready")
@@ -369,6 +376,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         default:
             break
         }
+    }
+
+    @objc private func tabStateEvent(_ notification: Notification) {
+        guard isEnabled,
+              let payload = notification.userInfo?[SettingsBridge.payloadKey] as? [String: Any],
+              let data = try? JSONSerialization.data(withJSONObject: payload),
+              let snapshot = try? JSONDecoder().decode(TabSnapshot.self, from: data) else { return }
+
+        let command = audioManager.evaluateTabState(snapshot)
+        let userInfo: [String: Any] = [
+            SettingsBridge.payloadKey: [
+                "browserBundleID": snapshot.browserBundleID,
+                "contextID": snapshot.contextID,
+                "command": command
+            ]
+        ]
+        DistributedNotificationCenter.default().postNotificationName(
+            SettingsBridge.tabCommandNotification,
+            object: nil,
+            userInfo: userInfo,
+            deliverImmediately: true
+        )
     }
 }
 

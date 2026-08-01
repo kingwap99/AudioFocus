@@ -11,10 +11,25 @@ struct SharedSettings: Codable {
 struct NativeRequest: Decodable {
     let type: String
     let browserBundleID: String?
+    let contextID: String?
+    let activeTabID: Int?
+    let windowFocused: Bool?
+    let tabs: [NativeTab]?
+}
+
+struct NativeTab: Decodable {
+    let id: Int
+    let audible: Bool?
+    let muted: Bool?
+    let playing: Bool?
+    let lastFocusedAt: Double?
+    let lastAudibleAt: Double?
 }
 
 let input = FileHandle.standardInput
 let output = FileHandle.standardOutput
+var clientBundleID: String?
+var clientContextID: String?
 
 func settingsURL() -> URL {
     FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -51,6 +66,66 @@ func reportBrowserEvent(_ type: String, bundleID: String?) {
     )
 }
 
+func forwardTabState(_ request: NativeRequest) {
+    guard let browserBundleID = request.browserBundleID,
+          let contextID = request.contextID else { return }
+    clientBundleID = browserBundleID
+    clientContextID = contextID
+
+    guard audioFocusIsRunning() else { return }
+    var payload: [String: Any] = [
+        "event": "tab_state",
+        "browserBundleID": browserBundleID,
+        "contextID": contextID,
+        "activeTabID": request.activeTabID ?? -1,
+        "windowFocused": request.windowFocused ?? false
+    ]
+    if let tabs = request.tabs {
+        payload["tabs"] = tabs.map { tab -> [String: Any] in
+            var value: [String: Any] = ["id": tab.id]
+            if let audible = tab.audible { value["audible"] = audible }
+            if let muted = tab.muted { value["muted"] = muted }
+            if let playing = tab.playing { value["playing"] = playing }
+            if let lastFocusedAt = tab.lastFocusedAt { value["lastFocusedAt"] = lastFocusedAt }
+            if let lastAudibleAt = tab.lastAudibleAt { value["lastAudibleAt"] = lastAudibleAt }
+            return value
+        }
+    }
+
+    DistributedNotificationCenter.default().postNotificationName(
+        Notification.Name("com.audiofocus.tabState"),
+        object: nil,
+        userInfo: ["payload": payload],
+        deliverImmediately: true
+    )
+}
+
+func listenForTabCommands() {
+    let queue = OperationQueue()
+    queue.qualityOfService = .userInitiated
+    let center = DistributedNotificationCenter.default()
+    let name = Notification.Name("com.audiofocus.tabCommand")
+    center.addObserver(
+        forName: name,
+        object: nil,
+        queue: queue
+    ) { notification in
+        guard let userInfo = notification.userInfo,
+              let payload = userInfo["payload"] as? [String: Any],
+              let browserBundleID = payload["browserBundleID"] as? String,
+              browserBundleID == clientBundleID,
+              let contextID = payload["contextID"] as? String,
+              contextID == clientContextID,
+              let data = try? JSONSerialization.data(withJSONObject: payload["command"] ?? [:]) else {
+            return
+        }
+        var length = UInt32(data.count).littleEndian
+        let prefix = Data(bytes: &length, count: MemoryLayout<UInt32>.size)
+        output.write(prefix)
+        output.write(data)
+    }
+}
+
 func readExactly(_ count: Int) -> Data? {
     var data = Data()
     while data.count < count {
@@ -68,6 +143,8 @@ func send(_ object: [String: Any]) {
     output.write(prefix)
     output.write(data)
 }
+
+listenForTabCommands()
 
 while let lengthData = readExactly(4) {
     let messageLength = lengthData.withUnsafeBytes { rawBuffer -> UInt32 in
@@ -99,6 +176,9 @@ while let lengthData = readExactly(4) {
         send(["type": "ack"])
     case "browser_owner_closed":
         reportBrowserEvent("owner_closed", bundleID: request.browserBundleID)
+        send(["type": "ack"])
+    case "tab_state":
+        forwardTabState(request)
         send(["type": "ack"])
     default:
         send(["type": "error", "message": "unsupported request"])

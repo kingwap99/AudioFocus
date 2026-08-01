@@ -11,6 +11,9 @@ enum SettingsBridge {
     static let browserAudioEventNotification = Notification.Name("com.audiofocus.browserAudioEvent")
     static let browserAudioEventKey = "event"
     static let browserBundleIDKey = "browserBundleID"
+    static let tabStateNotification = Notification.Name("com.audiofocus.tabState")
+    static let tabCommandNotification = Notification.Name("com.audiofocus.tabCommand")
+    static let payloadKey = "payload"
     static let chromeExtensionID = "pijagplcjlcnlgafkcegnbdjkgeoheak"
     static let firefoxExtensionID = "audiofocus-tab-controller@local"
 

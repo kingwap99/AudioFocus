@@ -46,7 +46,7 @@ Behavior:
 
 If an older unpacked copy is installed, remove it first and load this folder again.
 The current extension uses the fixed ID `pijagplcjlcnlgafkcegnbdjkgeoheak`.
-The lifecycle-aware controller with previous-owner restoration is version `1.1.5`.
+The thin-client controller that receives app commands is version `1.2.0`.
 
 ## Firefox
 

@@ -21,6 +21,7 @@ struct NativeTab: Decodable {
     let id: Int
     let audible: Bool?
     let muted: Bool?
+    let mutedByUs: Bool?
     let playing: Bool?
     let lastFocusedAt: Double?
     let lastAudibleAt: Double?
@@ -85,6 +86,7 @@ func forwardTabState(_ request: NativeRequest) {
             var value: [String: Any] = ["id": tab.id]
             if let audible = tab.audible { value["audible"] = audible }
             if let muted = tab.muted { value["muted"] = muted }
+            if let mutedByUs = tab.mutedByUs { value["mutedByUs"] = mutedByUs }
             if let playing = tab.playing { value["playing"] = playing }
             if let lastFocusedAt = tab.lastFocusedAt { value["lastFocusedAt"] = lastFocusedAt }
             if let lastAudibleAt = tab.lastAudibleAt { value["lastAudibleAt"] = lastAudibleAt }

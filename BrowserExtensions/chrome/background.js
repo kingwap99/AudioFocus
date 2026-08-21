@@ -1,22 +1,41 @@
+// AudioFocus tab controller — pure sensor/actuator (decision-core design §5/§6).
+// Reports tab facts (audible / playing / mutedByUs) and executes the app's
+// state_commands. All ownership decisions live in the macOS app; this worker
+// never decides which tab should be audible.
 const NATIVE_HOST = "com.audiofocus.nativehost";
 const BROWSER_BUNDLE_ID = "com.google.Chrome";
 const FADE_MS = 450;
 const RUNNING_RECONNECT_MS = 2000;
 const STOPPED_RECONNECT_MS = 5000;
+
 let controllerEnabled = false;
 let nativePort = null;
 let configTimer = null;
 let reconnectTimer = null;
-const managedTabs = new Set();
-const tabsToRestore = new Set();
-const tabActivity = new Map();
+let snapshotInFlight = false;
+let stateLoaded = false;
 
-function noteTabActivity(tab, focused = false) {
-  if (!tab?.id) return;
-  const activity = tabActivity.get(tab.id) || { lastAudibleAt: 0, lastFocusedAt: 0 };
-  if (tab.audible) activity.lastAudibleAt = Date.now();
-  if (focused) activity.lastFocusedAt = Date.now();
-  tabActivity.set(tab.id, activity);
+// Mute bookkeeping. Persisted to chrome.storage.session so a service-worker
+// restart cannot lose track of which tabs we muted (and must restore).
+let mutedByUs = new Set();
+let mutedByUser = new Set();
+
+async function loadState() {
+  try {
+    const stored = await chrome.storage.session.get(["mutedByUs", "mutedByUser"]);
+    mutedByUs = new Set(stored.mutedByUs || []);
+    mutedByUser = new Set(stored.mutedByUser || []);
+  } catch (_) {}
+  stateLoaded = true;
+}
+
+function saveState() {
+  try {
+    chrome.storage.session.set({
+      mutedByUs: [...mutedByUs],
+      mutedByUser: [...mutedByUser]
+    });
+  } catch (_) {}
 }
 
 function requestConfig() {
@@ -43,18 +62,19 @@ function closeNativePort() {
   try { port?.disconnect(); } catch (_) {}
 }
 
+// App stopped: restore every tab we muted so nothing stays silent.
 async function disableController() {
-  if (!controllerEnabled && !tabsToRestore.size) return;
+  if (!stateLoaded) await loadState();
+  if (!controllerEnabled && !mutedByUs.size) return;
   controllerEnabled = false;
 
-  const restoreTabIDs = [...tabsToRestore];
-  tabsToRestore.clear();
+  const restoreTabIDs = [...mutedByUs];
+  mutedByUs.clear();
+  saveState();
   for (const tabId of restoreTabIDs) {
     try { await chrome.tabs.update(tabId, { muted: false }); } catch (_) {}
     await sendFade(tabId, "in");
   }
-  managedTabs.clear();
-  tabActivity.clear();
 }
 
 async function enableController() {
@@ -115,8 +135,24 @@ async function sendFade(tabId, direction) {
 
 async function fadeOutAndMute(tabId) {
   if (!controllerEnabled || !tabId) return;
-  managedTabs.add(tabId);
-  tabsToRestore.add(tabId);
+  if (mutedByUser.has(tabId)) return;
+  if (mutedByUs.has(tabId)) {
+    try { await chrome.tabs.update(tabId, { muted: true }); } catch (_) {}
+    return;
+  }
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (tab?.mutedInfo?.muted) {
+      // The user muted this tab themselves; never touch it.
+      mutedByUser.add(tabId);
+      saveState();
+      return;
+    }
+  } catch (_) {
+    return;
+  }
+  mutedByUs.add(tabId);
+  saveState();
   await sendFade(tabId, "out");
   setTimeout(async () => {
     try { await chrome.tabs.update(tabId, { muted: true }); } catch (_) {}
@@ -124,16 +160,18 @@ async function fadeOutAndMute(tabId) {
 }
 
 async function fadeIn(tabId) {
-  if (!controllerEnabled) return;
-  managedTabs.add(tabId);
+  if (!controllerEnabled || !tabId) return;
+  if (mutedByUser.has(tabId)) return;
+  mutedByUs.delete(tabId);
+  saveState();
   try { await chrome.tabs.update(tabId, { muted: false }); } catch (_) { return; }
   await sendFade(tabId, "in");
-  tabsToRestore.delete(tabId);
 }
 
 async function mediaIsPlaying(tabId) {
   try {
     const frames = await chrome.webNavigation.getAllFrames({ tabId });
+    if (!Array.isArray(frames) || frames.length === 0) return null;
     const responses = await Promise.all(frames.map(async ({ frameId }) => {
       try {
         return await chrome.tabs.sendMessage(
@@ -160,25 +198,23 @@ async function mediaIsPlaying(tabId) {
 }
 
 async function buildTabSnapshot() {
-  const [activeWindow] = await chrome.windows.getAll({ populate: true, windowTypes: ["normal"] });
+  const windows = await chrome.windows.getAll({ populate: true, windowTypes: ["normal"] });
+  const activeWindow = (windows || []).find(window => window.focused) || (windows || [])[0] || null;
+  if (!activeWindow) return null;
   const tabs = activeWindow?.tabs ?? [];
   const activeTab = tabs.find(tab => tab.active) || tabs[0] || null;
-  const windowFocused = Boolean(activeWindow?.focused);
-
-  for (const tab of tabs) {
-    noteTabActivity(tab, tab.id === activeTab?.id);
-  }
+  const windowFocused = Boolean(activeWindow.focused);
 
   const snapshotTabs = await Promise.all(tabs.map(async (tab) => {
-    const activity = tabActivity.get(tab.id) || { lastAudibleAt: 0, lastFocusedAt: 0 };
+    // `playing` is the anti-feedback eligibility signal (design §5): it reflects
+    // the page's media elements, never the mute state we imposed.
     const playing = tab.audible ? null : await mediaIsPlaying(tab.id);
     return {
       id: tab.id,
       audible: tab.audible,
       muted: tab.mutedInfo?.muted ?? false,
-      playing,
-      lastFocusedAt: activity.lastFocusedAt || 0,
-      lastAudibleAt: activity.lastAudibleAt || 0
+      mutedByUs: mutedByUs.has(tab.id),
+      playing
     };
   }));
 
@@ -193,74 +229,100 @@ async function buildTabSnapshot() {
 }
 
 async function sendTabState() {
-  if (!controllerEnabled || !nativePort) return;
+  if (!controllerEnabled || !nativePort || snapshotInFlight) return;
+  snapshotInFlight = true;
   try {
-    nativePort.postMessage(await buildTabSnapshot());
-  } catch (_) {}
+    const snapshot = await buildTabSnapshot();
+    if (snapshot) nativePort.postMessage(snapshot);
+  } catch (_) {
+    // Restricted pages or a disappearing window can break one snapshot; the
+    // next tick retries instead of letting the service worker crash.
+  } finally {
+    snapshotInFlight = false;
+  }
 }
 
 async function applyStateCommand(message) {
   if (!controllerEnabled) return;
+  if (!stateLoaded) await loadState();
+
+  console.log("[AudioFocus] state_command", JSON.stringify({
+    muteAll: message.muteAll === true,
+    noAction: message.noAction === true,
+    actions: message.actions
+  }));
+  const actions = message.actions ?? [];
+  const unmuteAction = actions.find(action => action.kind === "unmute");
+  const muteOthers = actions.find(action => action.kind === "muteOthers");
+
   if (message.muteAll === true) {
     const tabs = await chrome.tabs.query({});
     for (const tab of tabs) {
-      if (tab.audible || managedTabs.has(tab.id)) {
+      if (tab.audible || mutedByUs.has(tab.id)) {
         await fadeOutAndMute(tab.id);
       }
     }
     return;
   }
 
-  for (const action of message.actions ?? []) {
-    if (action.kind === "unmute") {
-      await fadeIn(action.tabID);
-    } else if (action.kind === "mute") {
+  if (muteOthers) {
+    const tabs = await chrome.tabs.query({});
+    for (const tab of tabs) {
+      if (tab.id === muteOthers.tabID) continue;
+      // Only fade/mute tabs we haven't already muted, so we don't drive the
+      // owner's volume down on every cycle (the trigger of the "音量被拉回1格"
+      // bug). Audible tabs that aren't ours yet get one fade-out + mute.
+      if (tab.audible && !mutedByUs.has(tab.id)) {
+        await fadeOutAndMute(tab.id);
+      } else if (mutedByUs.has(tab.id) && !tab.mutedInfo?.muted) {
+        await chrome.tabs.update(tab.id, { muted: true }).catch(() => {});
+      }
+    }
+  }
+
+  for (const action of actions) {
+    if (action.kind === "mute") {
       await fadeOutAndMute(action.tabID);
     }
   }
-}
 
-async function muteAllLocally() {
-  const tabs = await chrome.tabs.query({});
-  for (const tab of tabs) {
-    if (tab.audible || managedTabs.has(tab.id)) {
-      await fadeOutAndMute(tab.id);
+  if (unmuteAction) {
+    // Fade the owner back in ONLY when it is currently muted by us; an already
+    // audible owner must be left alone so the user's volume slider sticks.
+    if (mutedByUs.has(unmuteAction.tabID)) {
+      await fadeIn(unmuteAction.tabID);
+    } else {
+      try { await chrome.tabs.update(unmuteAction.tabID, { muted: false }); } catch (_) {}
     }
   }
 }
 
-chrome.tabs.onActivated.addListener(async () => {
-  if (!controllerEnabled) return;
-  await sendTabState();
+chrome.tabs.onActivated.addListener(() => {
+  if (controllerEnabled) sendTabState().catch(() => {});
 });
 
-chrome.tabs.onUpdated.addListener(async (_tabId, changeInfo, tab) => {
+chrome.tabs.onUpdated.addListener((_tabId, changeInfo, tab) => {
   if (!controllerEnabled) return;
   if (changeInfo.audible !== undefined || changeInfo.mutedInfo !== undefined || (tab.active && tab.audible)) {
-    noteTabActivity(tab);
-    await sendTabState();
+    sendTabState().catch(() => {});
   }
 });
 
-chrome.windows.onFocusChanged.addListener(async (windowId) => {
-  if (!controllerEnabled) return;
-  if (windowId === chrome.windows.WINDOW_ID_NONE) {
-    await muteAllLocally();
-    return;
-  }
-  await sendTabState();
+chrome.windows.onFocusChanged.addListener(() => {
+  if (controllerEnabled) sendTabState().catch(() => {});
 });
 
-chrome.tabs.onRemoved.addListener(async (tabId) => {
-  managedTabs.delete(tabId);
-  tabsToRestore.delete(tabId);
-  tabActivity.delete(tabId);
-  if (controllerEnabled) await sendTabState();
+chrome.tabs.onRemoved.addListener((tabId) => {
+  if (mutedByUs.delete(tabId) || mutedByUser.delete(tabId)) saveState();
+  if (controllerEnabled) sendTabState().catch(() => {});
 });
 
 async function initialize() {
+  await loadState();
   connectNativeHost();
-  setInterval(() => sendTabState(), 1000);
+  setInterval(() => {
+    if (controllerEnabled) sendTabState().catch(() => {});
+  }, 1000);
 }
 
 initialize();

@@ -87,6 +87,13 @@ xattr -cr "$BUNDLE_DIR"
 codesign --force --deep --sign - --timestamp=none "$BUNDLE_DIR"
 xattr -d com.apple.FinderInfo "$BUNDLE_DIR" 2>/dev/null || true
 
+# macOS may re-add com.apple.provenance xattrs after signing (e.g. when
+# Spotlight/LaunchServices touch the bundle). Strip and re-sign once more so
+# `codesign --verify --strict` passes on the delivered artifact.
+xattr -cr "$BUNDLE_DIR"
+codesign --force --deep --sign - --timestamp=none "$BUNDLE_DIR" >/dev/null 2>&1
+codesign --verify --deep --strict "$BUNDLE_DIR" && echo "Signature verified"
+
 echo ""
 echo "=== Build Complete ==="
 echo "App: $BUNDLE_DIR"

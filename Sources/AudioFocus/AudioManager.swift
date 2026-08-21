@@ -22,9 +22,8 @@ struct TabSnapshot: Decodable {
         let id: Int
         let audible: Bool?
         let muted: Bool?
+        let mutedByUs: Bool?
         let playing: Bool?
-        let lastFocusedAt: Double?
-        let lastAudibleAt: Double?
     }
     let browserBundleID: String
     let contextID: String
@@ -33,19 +32,13 @@ struct TabSnapshot: Decodable {
     let tabs: [Tab]?
 }
 
-/// All state-changing inputs funnel through this event type so ownership,
-/// candidate, and recovery transitions stay on one serialized path.
+/// All state-changing inputs funnel through this serialized event type. Every
+/// event re-runs the decision procedure; transitions follow rules T1–T7 of the
+/// decision-core design doc.
 private enum AudioEvent {
-    case foregroundCandidate
-    case recheckSilentCandidate(remainingAttempts: Int)
-    case completeCandidateSwitch
-    case ownerTerminated
-    case browserOwnerActive
-    case browserOwnerClosed
-    case muteAllExcept
-    case switchDelayChanged
-    case whitelistChanged
     case poll
+    case delayExpired(generation: Int)
+    case settingsChanged
     case unmuteAll
 }
 
@@ -53,36 +46,71 @@ private enum AudioEvent {
 final class AudioManager {
     private static let log = OSLog(subsystem: "com.audiofocus.app", category: "AudioManager")
 
+    // MARK: - Sound sources (design doc §3.1)
+
+    private enum Source: Equatable, CustomStringConvertible {
+        case app(String)
+        case tab(browser: String, tabID: Int)
+
+        var family: String {
+            switch self {
+            case .app(let bundleID): return bundleID
+            case .tab(let browser, _): return browser
+            }
+        }
+
+        var description: String {
+            switch self {
+            case .app(let bundleID): return "app(\(bundleID))"
+            case .tab(let browser, let tabID): return "tab(\(browser)#\(tabID))"
+            }
+        }
+    }
+
+    private struct TabFact {
+        var audible: Bool
+        var playing: Bool?
+        var mutedByUs: Bool
+    }
+
+    private struct BrowserFacts {
+        var receivedAt: Date
+        var windowFocused: Bool
+        var activeTabID: Int?
+        var tabs: [Int: TabFact]
+    }
+
     weak var delegate: AudioManagerDelegate?
+
+    // MARK: - Decision state (design doc §3.2 — the ONLY decision state)
+
+    private var owner: Source?
+    private var pending: Source?
+    private var pendingGeneration = 0
+    private var history: [Source] = []
+
+    // MARK: - Facts (design doc §2)
+
+    private var foregroundBundleID: String?
+    private var terminatedBundleID: String?
+    private var browserFacts: [String: BrowserFacts] = [:]
+    private var extensionSeen = Set<String>()
+
+    // MARK: - Settings & pipeline state
+
+    private var whitelistBundleIDs = Set<String>()
+    private var switchDelay: TimeInterval = 0.5
+    private var mutedObjectIDs = Set<AudioObjectID>()
 
     private var tapID: AudioObjectID = kAudioObjectUnknown
     private var aggregateDeviceID: AudioObjectID = kAudioObjectUnknown
     private var ioProcID: AudioDeviceIOProcID?
     private var pollTimer: DispatchSourceTimer?
-    private var currentFocusBundleID: String?
-    private var pendingForegroundBundleID: String?
-    private var mutedObjectIDs = Set<AudioObjectID>()
-    private var whitelistBundleIDs = Set<String>()
-    private var switchDelay: TimeInterval = 0.5
-    private var candidateGeneration = 0
-    private var scheduledGeneration: Int?
-    private var recentForegroundBundleIDs: [String] = []
-    private var audibleOwnerHistory: [String] = []
-    private var silentRecheckRemaining = 0
-    private var pendingEventBundleID: String?
-    private var terminatedEventBundleID: String?
-    private var browserEventBundleID: String?
-    private var tabContextStates: [String: TabContextState] = [:]
 
-    private struct TabContextState {
-        var ownerTabID: Int?
-        var pendingTabID: Int?
-        var pendingAt: Date?
-    }
-
-    private let ownerCloseDebounce: TimeInterval = 0.25
-    private let silentCandidateRecheckInterval: TimeInterval = 0.25
-    private let silentCandidateRecheckAttempts = 8
+    private let tabStateFreshness: TimeInterval = 2.5
+    private let tabExistenceFreshness: TimeInterval = 10
+    private let historyLimit = 16
+    private let extensionBrowsers: Set<String> = ["com.google.Chrome", "org.mozilla.firefox"]
 
     private let controlQueue = DispatchQueue(label: "com.audiofocus.audio-control", qos: .userInitiated)
     private let ioQueue = DispatchQueue(label: "com.audiofocus.audio-io", qos: .userInteractive)
@@ -166,7 +194,7 @@ final class AudioManager {
         return AudioObjectGetPropertyData(objectID, &address, 0, nil, &size, &value) == noErr && value == 1
     }
 
-    // MARK: - Process selection
+    // MARK: - Family helpers
 
     private func isForegroundFamily(_ candidate: String, foreground: String?) -> Bool {
         guard let foreground, !foreground.isEmpty else { return false }
@@ -194,12 +222,20 @@ final class AudioManager {
         return foreground == "com.apple.Safari" && isSafariWebKitHelper(process)
     }
 
-    private func mutedProcesses(from all: [AudioProcessInfo], foreground: String?) -> [AudioProcessInfo] {
-        all.filter {
-            !protectedBundleIDs.contains($0.bundleID)
-                && !isWhitelistedProcess($0)
-                && !isForegroundFamily($0, foreground: foreground)
-        }
+   private func mutedProcesses(from all: [AudioProcessInfo], foreground: String?) -> [AudioProcessInfo] {
+       all.filter {
+           !protectedBundleIDs.contains($0.bundleID)
+               && !isWhitelistedProcess($0)
+               && !isForegroundFamily($0, foreground: foreground)
+               && !isExtensionBrowserProcess($0)
+       }
+   }
+
+    // Extension-managed browsers are muted per-tab by their extension; muting
+    // their CoreAudio process would also silence the very owner tab we are
+    // trying to hand audio to (and corrupt the extension's `audible` signal).
+    private func isExtensionBrowserProcess(_ process: AudioProcessInfo) -> Bool {
+        extensionBrowsers.contains { isForegroundFamily(process, foreground: $0) }
     }
 
     private func isWhitelistedFamily(_ candidate: String) -> Bool {
@@ -226,24 +262,310 @@ final class AudioManager {
         }
     }
 
-    private func isSameFamily(_ first: String, _ second: String) -> Bool {
-        first == second || first.hasPrefix(second + ".") || second.hasPrefix(first + ".")
-    }
+    // MARK: - Decision procedure (design doc §4)
 
-    private func rememberForeground(_ bundleID: String) {
-        recentForegroundBundleIDs.removeAll { $0 == bundleID }
-        recentForegroundBundleIDs.insert(bundleID, at: 0)
-        if recentForegroundBundleIDs.count > 20 {
-            recentForegroundBundleIDs.removeLast(recentForegroundBundleIDs.count - 20)
+    /// Fact: does this source still exist? (Tab existence is authoritative from
+    /// the extension; app existence from the CoreAudio process list.)
+    private func exists(_ source: Source, in all: [AudioProcessInfo]) -> Bool {
+        switch source {
+        case .app(let bundleID):
+            return familyExists(bundleID, in: all)
+        case .tab(let browser, let tabID):
+            guard let facts = browserFacts[browser],
+                  Date().timeIntervalSince(facts.receivedAt) <= tabExistenceFreshness else { return false }
+            return facts.tabs[tabID] != nil
         }
     }
 
-    private func rememberAudibleOwner(_ bundleID: String) {
-        audibleOwnerHistory.removeAll { $0 == bundleID }
-        audibleOwnerHistory.append(bundleID)
-        if audibleOwnerHistory.count > 12 {
-            audibleOwnerHistory.removeFirst(audibleOwnerHistory.count - 12)
+    /// Fact: is this source confirmed producing sound? Our own muting never
+    /// counts against eligibility (design doc §5).
+    private func eligible(_ source: Source, in all: [AudioProcessInfo]) -> Bool {
+        switch source {
+        case .app(let bundleID):
+            return familyIsOutputting(bundleID, in: all)
+        case .tab(let browser, let tabID):
+            guard let facts = browserFacts[browser],
+                  Date().timeIntervalSince(facts.receivedAt) <= tabExistenceFreshness,
+                  let tab = facts.tabs[tabID] else { return false }
+            if tab.playing == true { return true }
+            return tab.audible && !tab.mutedByUs
         }
+    }
+
+    /// Fact: which source is the user operating right now? Returns nil when the
+    /// focus is unknown (stale tab state) or whitelisted — never guesses from
+    /// process-level output for extension-managed browsers.
+    private func focusedSource(in all: [AudioProcessInfo]) -> Source? {
+        guard let foreground = foregroundBundleID,
+              !foreground.isEmpty,
+              !isWhitelistedFamily(foreground) else { return nil }
+        guard extensionBrowsers.contains(foreground) else { return .app(foreground) }
+        guard let facts = browserFacts[foreground] else {
+            // Extension never connected → plain app. Connected before but no
+            // data → unknown, do not fall back to process-level guessing.
+            return extensionSeen.contains(foreground) ? nil : .app(foreground)
+        }
+        guard Date().timeIntervalSince(facts.receivedAt) <= tabStateFreshness,
+              facts.windowFocused,
+              let activeID = facts.activeTabID,
+              facts.tabs[activeID] != nil else { return nil }
+        return .tab(browser: foreground, tabID: activeID)
+    }
+
+    /// Recomputes owner/pending from current facts. Called once per event.
+   private func runDecision(trigger: String, processes: [AudioProcessInfo]? = nil) {
+       let all = processes ?? getAudioProcesses()
+        let focused = focusedSource(in: all)
+        os_log(.info, log: Self.log,
+               "runDecision %{public}@ fg=%{public}@ owner=%{public}@ pending=%{public}@",
+               trigger,
+               foregroundBundleID ?? "nil",
+               owner?.description ?? "nil",
+               pending?.description ?? "nil")
+
+        // T1: owner disappeared → restore the most recent living, eligible
+        // history entry; if none, owner = nil (mute all, wait).
+        if let current = owner, !exists(current, in: all) {
+            os_log(.info, log: Self.log,
+                   "Decision T1 (%{public}@): owner %{public}@ gone",
+                   trigger, current.description)
+            history.removeAll { $0 == current }
+            history = history.filter { exists($0, in: all) }
+            owner = history.first { eligible($0, in: all) }
+            pending = nil
+            if let restored = owner {
+                os_log(.info, log: Self.log,
+                       "Decision T1: restored %{public}@", restored.description)
+                updateStatus("Owner closed; restored \(restored.description)")
+            } else {
+                os_log(.info, log: Self.log, "Decision T1: no restorable owner")
+                updateStatus("Owner closed; waiting for audible focus")
+            }
+        }
+
+
+        // T4: candidate lost focus or eligibility → drop it. Owner unchanged.
+        if let candidate = pending, candidate != focused || !eligible(candidate, in: all) {
+            os_log(.info, log: Self.log,
+                   "Decision T4 (%{public}@): candidate %{public}@ dropped (focused=%{public}@)",
+                   trigger, candidate.description, focused?.description ?? "nil")
+            pending = nil
+        }
+
+       // T2/T3: focused, eligible, non-owner source becomes the candidate and
+       // starts the (single) switch delay.
+       if let focused, focused != owner, eligible(focused, in: all), pending != focused {
+            // T2: no current owner to protect → take the first audible focused
+            // source immediately. The switch delay only exists to avoid yanking
+            // audio from a *living* owner on brief focus blips.
+            if owner == nil {
+                history.removeAll { $0 == focused }
+                owner = focused
+                pending = nil
+                os_log(.info, log: Self.log,
+                       "Decision T2 (%{public}@): owner=%{public}@ (immediate, no current owner)",
+                       trigger, focused.description)
+                updateStatus("Owner: \(focused.description)")
+            } else if pending != focused {
+                pending = focused
+                pendingGeneration += 1
+                os_log(.info, log: Self.log,
+                       "Decision T3 (%{public}@): candidate %{public}@ (owner=%{public}@, delay=%.2fs)",
+                       trigger, focused.description, owner?.description ?? "nil", switchDelay)
+                if switchDelay > 0 {
+                    updateStatus(String(format: "Switching to %@ in %.2fs", focused.description, switchDelay))
+                }
+                scheduleDelayExpired(generation: pendingGeneration)
+            }
+        }
+
+        // T6: focus silent or unknown → keep the current owner playing.
+        if trigger == "focus", pending == nil {
+            if focused == nil {
+                updateStatus("Holding \(owner?.description ?? "none"); focus unknown")
+            } else if let focused, !eligible(focused, in: all), focused != owner {
+                updateStatus("Holding \(owner?.description ?? "none"); focus is silent")
+            }
+        }
+
+        rebuildMuteSet(all)
+    }
+
+    private func scheduleDelayExpired(generation: Int) {
+        controlQueue.asyncAfter(deadline: .now() + switchDelay) { [weak self] in
+            self?.dispatch(.delayExpired(generation: generation))
+        }
+    }
+
+    /// T5: delay expired with the candidate still focused and eligible →
+    /// hand over ownership, pushing the old owner onto the history stack.
+    private func completePendingSwitch(generation: Int) {
+        guard generation == pendingGeneration, let candidate = pending else { return }
+        let all = getAudioProcesses()
+        guard candidate == focusedSource(in: all), eligible(candidate, in: all) else {
+            os_log(.info, log: Self.log,
+                   "Decision T4 (delayExpired): candidate %{public}@ no longer valid",
+                   candidate.description)
+            pending = nil
+            rebuildMuteSet(all)
+            return
+        }
+
+        history.removeAll { $0 == candidate }
+        if let old = owner, old != candidate {
+            history.insert(old, at: 0)
+            if history.count > historyLimit {
+                history.removeLast(history.count - historyLimit)
+            }
+        }
+        owner = candidate
+        pending = nil
+        os_log(.info, log: Self.log,
+               "Decision T5: owner=%{public}@ history=%{public}@",
+               candidate.description,
+               history.map(\.description).joined(separator: ", "))
+        updateStatus("Owner: \(candidate.description)")
+        rebuildMuteSet(all)
+    }
+
+    /// Derives the process-level mute set from the owner (design doc §6).
+    private func rebuildMuteSet(_ all: [AudioProcessInfo]) {
+        let muted = mutedProcesses(from: all, foreground: owner?.family)
+        let newIDs = Set(muted.map(\.objectID))
+        guard newIDs != mutedObjectIDs else { return }
+        _ = createPipeline(for: muted)
+        DispatchQueue.main.async { [weak self] in
+            self?.delegate?.audioManagerDidUpdateProcessList(muted)
+        }
+    }
+
+    // MARK: - Event dispatch
+
+    private func dispatch(_ event: AudioEvent) {
+        controlQueue.async { [weak self] in
+            self?.handle(event)
+        }
+    }
+
+    private func handle(_ event: AudioEvent) {
+        switch event {
+        case .poll:
+            let all = getAudioProcesses()
+            runDecision(trigger: "poll", processes: all)
+
+        case .delayExpired(let generation):
+            completePendingSwitch(generation: generation)
+
+        case .settingsChanged:
+            runDecision(trigger: "settings")
+
+        case .unmuteAll:
+            owner = nil
+            pending = nil
+            history.removeAll()
+            destroyPipeline()
+            updateStatus("Paused")
+            DispatchQueue.main.async { [weak self] in
+                self?.delegate?.audioManagerDidUpdateProcessList([])
+            }
+        }
+    }
+
+    // MARK: - Public API
+
+    /// E1: the foreground app changed.
+    func focusChanged(bundleID: String?) {
+        controlQueue.async { [weak self] in
+            guard let self else { return }
+            self.foregroundBundleID = bundleID
+            self.runDecision(trigger: "focus")
+        }
+    }
+
+    /// E3: an app terminated. Drops its browser facts so tab owners are
+    /// reclaimed immediately instead of waiting for facts to go stale.
+    func appTerminated(bundleID: String?) {
+        controlQueue.async { [weak self] in
+            guard let self else { return }
+            if let bundleID {
+                self.browserFacts.removeValue(forKey: bundleID)
+                self.extensionSeen.remove(bundleID)
+            }
+            self.runDecision(trigger: "terminated")
+        }
+    }
+
+    /// E2 (browser): stores the extension's tab facts, re-runs the decision
+    /// procedure, and returns the command for the extension to execute.
+    /// Called from the main thread; serialized onto the control queue.
+    func evaluateTabState(_ snapshot: TabSnapshot) -> [String: Any] {
+        var command: [String: Any] = [:]
+        controlQueue.sync {
+            extensionSeen.insert(snapshot.browserBundleID)
+            var tabs: [Int: TabFact] = [:]
+            for tab in snapshot.tabs ?? [] {
+                tabs[tab.id] = TabFact(
+                    audible: tab.audible ?? false,
+                    playing: tab.playing,
+                    mutedByUs: tab.mutedByUs ?? false
+                )
+            }
+            browserFacts[snapshot.browserBundleID] = BrowserFacts(
+                receivedAt: Date(),
+                windowFocused: snapshot.windowFocused,
+                activeTabID: snapshot.activeTabID.flatMap { $0 >= 0 ? $0 : nil },
+                tabs: tabs
+            )
+           runDecision(trigger: "tab_state")
+           command = tabCommand(for: snapshot.browserBundleID, contextID: snapshot.contextID)
+            let active = snapshot.activeTabID.flatMap { $0 >= 0 ? $0 : nil }
+            let audibleCount = tabs.values.filter { $0.audible }.count
+            let activeAudible = active.flatMap { tabs[$0]?.audible } ?? false
+            os_log(.info, log: Self.log,
+                   "tabCmd %{public}@ active=%d activeAudible=%d audibleTabs=%d cmd=%{public}@",
+                   snapshot.browserBundleID, active ?? -1, activeAudible ? 1 : 0, audibleCount,
+                   command["muteAll"] as? Bool == true ? "muteAll"
+                   : (command["noAction"] as? Bool == true ? "noAction" : "unmute+muteOthers"))
+       }
+       return command
+   }
+
+    /// Tab-level commands derived from the owner (design doc §6): only the
+   /// owner browser gets actions; everyone else is handled at process level.
+    private func tabCommand(for browser: String, contextID: String) -> [String: Any] {
+        var command: [String: Any] = ["type": "state_command", "contextID": contextID]
+        if case .tab(let ownerBrowser, let ownerTabID) = owner, ownerBrowser == browser {
+            // This browser owns: restore its owner tab, mute the rest.
+            command["actions"] = [
+                ["kind": "unmute", "tabID": ownerTabID, "fade": true],
+                ["kind": "muteOthers", "tabID": ownerTabID, "fade": true]
+            ]
+            return command
+        }
+        // Browsers are never muted at the CoreAudio process level (Fix A), so a
+        // non-owner browser must mute all of its own tabs here. When there is no
+        // owner at all, an audible focused tab is taken immediately (T2) before
+        // this command is built, so muteAll never silences the tab we want.
+        command["muteAll"] = true
+        return command
+    }
+
+    func setSwitchDelay(_ delay: TimeInterval) {
+        controlQueue.async { [weak self] in
+            self?.switchDelay = max(0, delay)
+            self?.dispatch(.settingsChanged)
+        }
+    }
+
+    func setWhitelist(_ bundleIDs: Set<String>) {
+        controlQueue.async { [weak self] in
+            self?.whitelistBundleIDs = bundleIDs
+            self?.dispatch(.settingsChanged)
+        }
+    }
+
+    func unmuteAll() {
+        dispatch(.unmuteAll)
     }
 
     // MARK: - CoreAudio pipeline
@@ -370,418 +692,13 @@ final class AudioManager {
         }
     }
 
-    // MARK: - Public API
-
-    private func dispatch(_ event: AudioEvent) {
-        controlQueue.async { [weak self] in
-            self?.handle(event)
-        }
-    }
-
-    /// Single serialized entry point for all state transitions.
-    ///
-    /// Every timer callback and every public API funnels through here, so the
-    /// ownership, candidate, and recovery state machines cannot interleave.
-    private func handle(_ event: AudioEvent) {
-        switch event {
-        case .foregroundCandidate:
-            considerForegroundCandidateNow()
-
-        case .recheckSilentCandidate(let remainingAttempts):
-            guard let pending = pendingForegroundBundleID else { return }
-            let latest = getAudioProcesses()
-            if familyIsOutputting(pending, in: latest) {
-                scheduleCandidate(pending, generation: candidateGeneration)
-                return
-            }
-            guard remainingAttempts > 1 else {
-                silentRecheckRemaining = 0
-                return
-            }
-            silentRecheckRemaining = remainingAttempts - 1
-            scheduleSilentCandidateRecheck(
-                generation: candidateGeneration,
-                remainingAttempts: silentRecheckRemaining
-            )
-
-        case .completeCandidateSwitch:
-            guard let bundleID = pendingForegroundBundleID,
-                  scheduledGeneration == candidateGeneration,
-                  familyIsOutputting(bundleID, in: getAudioProcesses()) else {
-                let owner = currentFocusBundleID ?? "none"
-                updateStatus("Holding \(owner); candidate became silent")
-                return
-            }
-            scheduledGeneration = nil
-            applyFocus(bundleID)
-
-        case .ownerTerminated:
-            recoverForTerminatedOwner()
-
-        case .browserOwnerActive:
-            considerForegroundCandidateNow()
-
-        case .browserOwnerClosed:
-            guard let bundleID = browserEventBundleID,
-                  let owner = currentFocusBundleID,
-                  isSameFamily(bundleID, owner) else { return }
-
-            candidateGeneration += 1
-            scheduledGeneration = nil
-            silentRecheckRemaining = 0
-            audibleOwnerHistory.removeAll { isSameFamily($0, bundleID) }
-            let all = getAudioProcesses()
-
-            guard let previousOwner = audibleOwnerHistory.reversed().first(where: {
-                familyExists($0, in: all)
-            }) else {
-                currentFocusBundleID = nil
-                pendingForegroundBundleID = bundleID
-                let muted = mutedProcesses(from: all, foreground: nil)
-                _ = createPipeline(for: muted)
-                updateStatus("Browser owner closed; waiting for audible foreground")
-                DispatchQueue.main.async { [weak self] in
-                    self?.delegate?.audioManagerDidUpdateProcessList(muted)
-                }
-                return
-            }
-
-            pendingForegroundBundleID = bundleID
-            applyFocus(previousOwner, allProcesses: all, preservePending: true)
-            updateStatus("Browser owner closed; restored \(previousOwner)")
-
-        case .muteAllExcept:
-            guard let bundleID = pendingEventBundleID ?? pendingForegroundBundleID,
-                  !bundleID.isEmpty else { return }
-            pendingForegroundBundleID = bundleID
-            rememberForeground(bundleID)
-            applyFocus(bundleID)
-
-        case .switchDelayChanged:
-            break
-
-        case .whitelistChanged:
-            guard let focus = currentFocusBundleID else { return }
-            applyFocus(focus)
-
-        case .poll:
-            let all = getAudioProcesses()
-
-            if let pending = pendingForegroundBundleID,
-               familyIsOutputting(pending, in: all) {
-                scheduleCandidate(pending, generation: candidateGeneration)
-                return
-            }
-
-            guard let focus = currentFocusBundleID else { return }
-            if !familyIsOutputting(focus, in: all) {
-                recoverFromPoll(owner: focus, processes: all)
-            }
-            let muted = mutedProcesses(from: all, foreground: focus)
-            let newIDs = Set(muted.map(\.objectID))
-            if newIDs != mutedObjectIDs {
-                _ = createPipeline(for: muted)
-                DispatchQueue.main.async { [weak self] in
-                    self?.delegate?.audioManagerDidUpdateProcessList(muted)
-                }
-            }
-
-        case .unmuteAll:
-            destroyPipeline()
-            updateStatus("Paused")
-            DispatchQueue.main.async { [weak self] in
-                self?.delegate?.audioManagerDidUpdateProcessList([])
-            }
-        }
-    }
-
-    /// Changes audio ownership only when the newly focused app is actually outputting audio.
-    /// A silent window remains pending while the previous audible owner keeps playing.
-    func considerForegroundCandidate(bundleID: String?) {
-        guard let bundleID, !bundleID.isEmpty else { return }
-        pendingForegroundBundleID = bundleID
-        dispatch(.foregroundCandidate)
-    }
-
-    private func scheduleSilentCandidateRecheck(
-        generation: Int,
-        remainingAttempts: Int
-    ) {
-        guard remainingAttempts > 0 else { return }
-        controlQueue.asyncAfter(deadline: .now() + silentCandidateRecheckInterval) { [weak self] in
-            guard let self, self.candidateGeneration == generation else { return }
-            self.dispatch(.recheckSilentCandidate(remainingAttempts: remainingAttempts))
-        }
-    }
-
-    private func scheduleInactiveOwnerRecovery(generation: Int, force: Bool = false) {
-        controlQueue.asyncAfter(deadline: .now() + ownerCloseDebounce) { [weak self] in
-            guard let self, self.candidateGeneration == generation else { return }
-            self.runInactiveOwnerRecovery(generation: generation, force: force)
-        }
-    }
-
-    private func considerForegroundCandidateNow() {
-        guard let bundleID = pendingEventBundleID ?? pendingForegroundBundleID,
-              !bundleID.isEmpty else { return }
-        pendingForegroundBundleID = bundleID
-        rememberForeground(bundleID)
-        candidateGeneration += 1
-        scheduledGeneration = nil
-        silentRecheckRemaining = 0
-        let all = getAudioProcesses()
-
-        if currentFocusBundleID == nil || familyIsOutputting(bundleID, in: all) {
-            scheduleCandidate(bundleID, generation: candidateGeneration)
-        } else {
-            let owner = currentFocusBundleID ?? "none"
-            updateStatus("Holding \(owner); front window is silent")
-            scheduleInactiveOwnerRecovery(generation: candidateGeneration)
-            silentRecheckRemaining = silentCandidateRecheckAttempts
-            scheduleSilentCandidateRecheck(
-                generation: candidateGeneration,
-                remainingAttempts: silentRecheckRemaining
-            )
-        }
-    }
-
-    private func recoverForTerminatedOwner() {
-        guard let owner = currentFocusBundleID,
-              let terminatedBundleID = terminatedEventBundleID,
-              isSameFamily(terminatedBundleID, owner) else { return }
-        let all = getAudioProcesses()
-        guard !familyIsOutputting(owner, in: all) else { return }
-        runInactiveOwnerRecovery(generation: candidateGeneration, force: true)
-    }
-
-    private func recoverFromPoll(owner: String, processes: [AudioProcessInfo]) {
-        guard !familyIsOutputting(owner, in: processes) else { return }
-
-        if let terminatedBundleID = terminatedEventBundleID,
-           !isSameFamily(terminatedBundleID, owner) {
-            return
-        }
-        let foregroundMovedAway = pendingForegroundBundleID.map { $0 != owner } ?? false
-        guard !familyExists(owner, in: processes) || foregroundMovedAway else {
-            // Browsers briefly stop output while navigating. Keep their process
-            // family excluded from the mute pipeline until it resumes.
-            return
-        }
-
-        let savedFocus = owner
-        runInactiveOwnerRecovery(generation: candidateGeneration, processes: processes)
-        guard currentFocusBundleID == savedFocus else { return }
-    }
-
-    private func runInactiveOwnerRecovery(
-        generation: Int,
-        processes: [AudioProcessInfo]? = nil,
-        force: Bool = false
-    ) {
-        guard candidateGeneration == generation,
-              let owner = currentFocusBundleID else { return }
-
-        let all = processes ?? getAudioProcesses()
-        guard !familyIsOutputting(owner, in: all) else { return }
-        let foregroundMovedAway = pendingForegroundBundleID.map { $0 != owner } ?? false
-        guard force || !familyExists(owner, in: all) || foregroundMovedAway else {
-            // Browsers briefly stop output while navigating. Keep their process
-            // family excluded from the mute pipeline until it resumes.
-            return
-        }
-
-        if let candidate = recoveryCandidate(excluding: owner, in: all) {
-            let preservePending = candidate != pendingForegroundBundleID
-            updateStatus("Owner closed; restoring \(candidate)")
-            applyFocus(candidate, allProcesses: all, preservePending: preservePending)
-            return
-        }
-
-        currentFocusBundleID = nil
-        scheduledGeneration = nil
-        let muted = mutedProcesses(from: all, foreground: nil)
-        _ = createPipeline(for: muted)
-        updateStatus("Owner closed; waiting for audible foreground")
-        DispatchQueue.main.async { [weak self] in
-            self?.delegate?.audioManagerDidUpdateProcessList(muted)
-        }
-    }
-
-    private func recoveryCandidate(
-        excluding owner: String,
-        in processes: [AudioProcessInfo]
-    ) -> String? {
-        if let pending = pendingForegroundBundleID,
-           pending != owner,
-           familyIsOutputting(pending, in: processes) {
-            return pending
-        }
-
-        return recentForegroundBundleIDs.first {
-            $0 != owner
-                && !protectedBundleIDs.contains($0)
-                && !isWhitelistedFamily($0)
-                && familyIsOutputting($0, in: processes)
-        }
-    }
-
-    private func scheduleCandidate(_ bundleID: String, generation: Int) {
-        guard scheduledGeneration != generation else { return }
-        scheduledGeneration = generation
-
-        if switchDelay > 0 {
-            updateStatus(String(format: "Switching in %.2fs if audio stays active", switchDelay))
-        }
-
-        controlQueue.asyncAfter(deadline: .now() + switchDelay) { [weak self] in
-            guard let self,
-                  self.candidateGeneration == generation,
-                  self.pendingForegroundBundleID == bundleID else { return }
-            self.dispatch(.completeCandidateSwitch)
-        }
-    }
-
-    private func applyFocus(
-        _ bundleID: String,
-        allProcesses: [AudioProcessInfo]? = nil,
-        preservePending: Bool = false
-    ) {
-        currentFocusBundleID = bundleID
-        if !preservePending {
-            pendingForegroundBundleID = nil
-        }
-        scheduledGeneration = nil
-        let all = allProcesses ?? getAudioProcesses()
-        if familyIsOutputting(bundleID, in: all) {
-            rememberAudibleOwner(bundleID)
-        }
-        let muted = mutedProcesses(from: all, foreground: bundleID)
-        _ = createPipeline(for: muted)
-        DispatchQueue.main.async { [weak self] in
-            self?.delegate?.audioManagerDidUpdateProcessList(muted)
-        }
-    }
-
-    func muteAllExcept(bundleID: String?) {
-        guard let bundleID, !bundleID.isEmpty else { return }
-        pendingForegroundBundleID = bundleID
-        dispatch(.muteAllExcept)
-    }
-
-    func considerOwnerTermination(bundleID: String?) {
-        guard let bundleID else { return }
-        terminatedEventBundleID = bundleID
-        dispatch(.ownerTerminated)
-    }
-
-    /// Restores the prior audible app after a browser confirms that its owner tab
-    /// closed and the replacement active tab is still silent.
-    func browserOwnerDidClose(bundleID: String?) {
-        guard let bundleID else { return }
-        browserEventBundleID = bundleID
-        dispatch(.browserOwnerClosed)
-    }
-
-    func setSwitchDelay(_ delay: TimeInterval) {
-        switchDelay = max(0, delay)
-        dispatch(.switchDelayChanged)
-    }
-
-    func setWhitelist(_ bundleIDs: Set<String>) {
-        whitelistBundleIDs = bundleIDs
-        dispatch(.whitelistChanged)
-    }
-
-    /// Evaluates a browser tab snapshot and returns a `state_command` payload
-    /// for the extension to apply. Runs on the control queue.
-    func evaluateTabState(_ snapshot: TabSnapshot) -> [String: Any] {
-        var result: [String: Any] = [:]
-        controlQueue.sync {
-            result = evaluateTabStateOnQueue(snapshot)
-        }
-        return result
-    }
-
-    private func evaluateTabStateOnQueue(_ snapshot: TabSnapshot) -> [String: Any] {
-        var command: [String: Any] = [
-            "type": "state_command",
-            "contextID": snapshot.contextID
-        ]
-        var context = tabContextStates[snapshot.contextID] ?? TabContextState()
-
-        let browserIsOwner = currentFocusBundleID.map {
-            isSameFamily(snapshot.browserBundleID, $0)
-        } ?? false
-        let foregroundIsBrowser = (pendingEventBundleID ?? pendingForegroundBundleID).map {
-            isSameFamily(snapshot.browserBundleID, $0)
-        } ?? false
-
-        guard browserIsOwner || foregroundIsBrowser, snapshot.windowFocused else {
-            context.ownerTabID = nil
-            context.pendingTabID = nil
-            context.pendingAt = nil
-            tabContextStates[snapshot.contextID] = context
-            command["muteAll"] = true
-            return command
-        }
-
-        guard let activeTabID = snapshot.activeTabID else {
-            command["muteAll"] = true
-            return command
-        }
-        let activeTab = snapshot.tabs?.first { $0.id == activeTabID }
-        let activeTabIsPlaying = activeTab?.audible == true || activeTab?.playing == true
-
-        guard activeTabIsPlaying else {
-            context.ownerTabID = nil
-            context.pendingTabID = nil
-            context.pendingAt = nil
-            tabContextStates[snapshot.contextID] = context
-            command["muteAll"] = true
-            return command
-        }
-
-        if context.ownerTabID == activeTabID {
-            command["actions"] = [
-                ["kind": "unmute", "tabID": activeTabID, "fade": true]
-            ]
-            return command
-        }
-
-        if context.pendingTabID == activeTabID,
-           let pendingAt = context.pendingAt,
-           Date().timeIntervalSince(pendingAt) >= switchDelay {
-            context.ownerTabID = activeTabID
-            context.pendingTabID = nil
-            context.pendingAt = nil
-            tabContextStates[snapshot.contextID] = context
-            command["actions"] = [
-                ["kind": "unmute", "tabID": activeTabID, "fade": true]
-            ]
-            return command
-        }
-
-        if context.pendingTabID != activeTabID {
-            context.pendingTabID = activeTabID
-            context.pendingAt = Date()
-            tabContextStates[snapshot.contextID] = context
-        }
-        command["muteAll"] = true
-        return command
-    }
-
-    func unmuteAll() {
-        dispatch(.unmuteAll)
-    }
-
     // MARK: - Polling
 
     func startPolling(interval: TimeInterval = 3.0) {
         pollTimer = DispatchSource.makeTimerSource(queue: controlQueue)
         pollTimer?.schedule(deadline: .now() + interval, repeating: interval)
         pollTimer?.setEventHandler { [weak self] in
-            guard let self else { return }
-            self.dispatch(.poll)
+            self?.dispatch(.poll)
         }
         pollTimer?.resume()
     }

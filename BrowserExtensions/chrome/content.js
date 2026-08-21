@@ -14,7 +14,11 @@ function fadeMedia(element, direction, duration) {
   }
 
   if (direction === "out") {
-    if (state.direction === null && element.volume > 0) {
+    // Only remember this as the "real" volume when it is a genuine playback
+    // level, never our own faded-down floor. Otherwise a second consecutive
+    // fade-out would lock in 0.01 and every later fade-in would restore to
+    // "1格" — the exact bug we are fixing.
+    if (state.direction === null && element.volume > FADE_FLOOR * 2) {
       state.volume = element.volume;
     }
     state.muted = element.muted;
@@ -26,9 +30,13 @@ function fadeMedia(element, direction, duration) {
   state.direction = direction;
   const from = element.volume;
   const savedVolume = Math.max(0, Math.min(1, state.volume));
+  // Fade-out drives volume down toward the floor. Fade-in restores the
+  // remembered genuine level — but only upward: never force the page's audio
+  // below where the user currently has it, so manual volume changes survive
+  // our re-assertion. Choose max(remembered, current) as the restore target.
   const to = direction === "out"
     ? (savedVolume > 0 ? Math.min(FADE_FLOOR, savedVolume) : 0)
-    : savedVolume;
+    : Math.max(savedVolume, element.volume);
   const started = performance.now();
   const fadeDuration = Math.max(1, duration);
 

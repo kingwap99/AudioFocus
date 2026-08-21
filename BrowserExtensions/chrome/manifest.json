@@ -1,0 +1,20 @@
+{
+  "manifest_version": 3,
+  "name": "AudioFocus Tab Controller",
+  "version": "1.3.3",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAzVdeDhjX9g6C/bUjrJj7b/SrPX+J8Fx2nj+oglLFYrOTeM9YB6z9aZbjshDt8C91QyDq/GGt1aWz710Hr3YhnFMZC9+3vccH8tCUMq3/okpHUtY1hDQC3b+0gcvjoNJdSD22ZbcRzBIrpekT2JygGFSAbkVU4bxdlAGtwhKvrKmVARsEkOSOGyXCROH3SZW0lQzN7oEpUTDY6oFEEzQIHj+JZ7wTbJcO23vhosaLCuoAGNAleHgswMQJq8e1sZg97upLfTH/Oj5Ro4oZTfr+S866zuyzpm49EmvFzgHmUMpmFGNatCavNcGYQnKZ8gtEoF0VEMTvV5FbJPH7figoWwIDAQAB",
+  "description": "Keeps the last focused audible tab playing and fades other tabs out.",
+  "permissions": ["tabs", "nativeMessaging", "webNavigation", "storage"],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_start",
+      "all_frames": true
+    }
+  ]
+}

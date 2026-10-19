@@ -15,6 +15,9 @@ struct AudioProcessInfo: Equatable {
 protocol AudioManagerDelegate: AnyObject {
     func audioManagerDidUpdateProcessList(_ mutedProcesses: [AudioProcessInfo])
     func audioManagerDidChangeStatus(_ status: String)
+    /// Ownership changed: deliver these tab commands to the extensions right
+    /// away instead of waiting for their next snapshot tick.
+    func audioManagerDidIssueTabCommands(_ commands: [[String: Any]])
 }
 
 struct TabSnapshot: Decodable {
@@ -77,6 +80,7 @@ final class AudioManager {
         var receivedAt: Date
         var windowFocused: Bool
         var activeTabID: Int?
+        var contextID: String
         var tabs: [Int: TabFact]
     }
 
@@ -110,6 +114,8 @@ final class AudioManager {
     private let tabStateFreshness: TimeInterval = 2.5
     private let tabExistenceFreshness: TimeInterval = 10
     private let historyLimit = 16
+    private let extensionGracePeriod: TimeInterval = 5
+    private let launchedAt = Date()
     private let extensionBrowsers: Set<String> = ["com.google.Chrome", "org.mozilla.firefox"]
 
     private let controlQueue = DispatchQueue(label: "com.audiofocus.audio-control", qos: .userInitiated)
@@ -222,20 +228,21 @@ final class AudioManager {
         return foreground == "com.apple.Safari" && isSafariWebKitHelper(process)
     }
 
-   private func mutedProcesses(from all: [AudioProcessInfo], foreground: String?) -> [AudioProcessInfo] {
-       all.filter {
-           !protectedBundleIDs.contains($0.bundleID)
-               && !isWhitelistedProcess($0)
-               && !isForegroundFamily($0, foreground: foreground)
-               && !isExtensionBrowserProcess($0)
-       }
-   }
+    private func mutedProcesses(from all: [AudioProcessInfo], foreground: String?) -> [AudioProcessInfo] {
+        all.filter {
+            !protectedBundleIDs.contains($0.bundleID)
+                && !isWhitelistedProcess($0)
+                && !isForegroundFamily($0, foreground: foreground)
+                && !isManagedExtensionBrowserProcess($0)
+        }
+    }
 
-    // Extension-managed browsers are muted per-tab by their extension; muting
-    // their CoreAudio process would also silence the very owner tab we are
-    // trying to hand audio to (and corrupt the extension's `audible` signal).
-    private func isExtensionBrowserProcess(_ process: AudioProcessInfo) -> Bool {
-        extensionBrowsers.contains { isForegroundFamily(process, foreground: $0) }
+    // A browser whose extension is connected is muted per-tab by that
+    // extension; muting its CoreAudio process would also silence the very
+    // owner tab we are handing audio to. A browser that never connected has no
+    // per-tab control, so it must still be muted at process level.
+    private func isManagedExtensionBrowserProcess(_ process: AudioProcessInfo) -> Bool {
+        extensionSeen.contains { isForegroundFamily(process, foreground: $0) }
     }
 
     private func isWhitelistedFamily(_ candidate: String) -> Bool {
@@ -269,6 +276,13 @@ final class AudioManager {
     private func exists(_ source: Source, in all: [AudioProcessInfo]) -> Bool {
         switch source {
         case .app(let bundleID):
+            // CoreAudio process objects disappear whenever an app stops
+            // producing audio for a moment (pause, navigation, ad break).
+            // That is "silent", not "gone", so app existence comes from the
+            // process registry instead of the audio object list.
+            if !NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).isEmpty {
+                return true
+            }
             return familyExists(bundleID, in: all)
         case .tab(let browser, let tabID):
             guard let facts = browserFacts[browser],
@@ -287,8 +301,14 @@ final class AudioManager {
             guard let facts = browserFacts[browser],
                   Date().timeIntervalSince(facts.receivedAt) <= tabExistenceFreshness,
                   let tab = facts.tabs[tabID] else { return false }
+            if tab.mutedByUs {
+                // We muted this tab ourselves, so Chrome's audible flag
+                // reflects our mute rather than the page. Only an explicit
+                // "not playing" disqualifies it; unknown counts as playing.
+                return tab.playing != false
+            }
             if tab.playing == true { return true }
-            return tab.audible && !tab.mutedByUs
+            return tab.audible
         }
     }
 
@@ -301,12 +321,17 @@ final class AudioManager {
               !isWhitelistedFamily(foreground) else { return nil }
         guard extensionBrowsers.contains(foreground) else { return .app(foreground) }
         guard let facts = browserFacts[foreground] else {
-            // Extension never connected → plain app. Connected before but no
-            // data → unknown, do not fall back to process-level guessing.
-            return extensionSeen.contains(foreground) ? nil : .app(foreground)
+            // No tab facts yet. After launch, give the extension a moment to
+            // reconnect before falling back to process-level ownership; a
+            // browser that never connected behaves as a plain app.
+            if extensionSeen.contains(foreground) { return nil }
+            return Date().timeIntervalSince(launchedAt) < extensionGracePeriod ? nil : .app(foreground)
         }
+        // The browser being the frontmost app already proves the user is in
+        // it. chrome.windows.Window.focused is unreliable on macOS with
+        // multiple windows or Spaces (it reports false while the browser is
+        // frontmost), which used to disable switching entirely.
         guard Date().timeIntervalSince(facts.receivedAt) <= tabStateFreshness,
-              facts.windowFocused,
               let activeID = facts.activeTabID,
               facts.tabs[activeID] != nil else { return nil }
         return .tab(browser: foreground, tabID: activeID)
@@ -317,9 +342,10 @@ final class AudioManager {
        let all = processes ?? getAudioProcesses()
         let focused = focusedSource(in: all)
         os_log(.info, log: Self.log,
-               "runDecision %{public}@ fg=%{public}@ owner=%{public}@ pending=%{public}@",
+               "runDecision %{public}@ fg=%{public}@ focused=%{public}@ owner=%{public}@ pending=%{public}@",
                trigger,
                foregroundBundleID ?? "nil",
+               focused?.description ?? "nil",
                owner?.description ?? "nil",
                pending?.description ?? "nil")
 
@@ -341,11 +367,15 @@ final class AudioManager {
                 os_log(.info, log: Self.log, "Decision T1: no restorable owner")
                 updateStatus("Owner closed; waiting for audible focus")
             }
+            emitTabCommands()
         }
 
 
-        // T4: candidate lost focus or eligibility → drop it. Owner unchanged.
-        if let candidate = pending, candidate != focused || !eligible(candidate, in: all) {
+        // T4: candidate lost focus or disappeared → drop it. A momentary
+        // eligibility blip (often caused by our own muteOthers) must not cancel
+        // the switch, otherwise the delay restarts forever and the handover
+        // never happens.
+        if let candidate = pending, candidate != focused || !exists(candidate, in: all) {
             os_log(.info, log: Self.log,
                    "Decision T4 (%{public}@): candidate %{public}@ dropped (focused=%{public}@)",
                    trigger, candidate.description, focused?.description ?? "nil")
@@ -366,6 +396,7 @@ final class AudioManager {
                        "Decision T2 (%{public}@): owner=%{public}@ (immediate, no current owner)",
                        trigger, focused.description)
                 updateStatus("Owner: \(focused.description)")
+                emitTabCommands()
             } else if pending != focused {
                 pending = focused
                 pendingGeneration += 1
@@ -402,7 +433,7 @@ final class AudioManager {
     private func completePendingSwitch(generation: Int) {
         guard generation == pendingGeneration, let candidate = pending else { return }
         let all = getAudioProcesses()
-        guard candidate == focusedSource(in: all), eligible(candidate, in: all) else {
+        guard candidate == focusedSource(in: all), exists(candidate, in: all) else {
             os_log(.info, log: Self.log,
                    "Decision T4 (delayExpired): candidate %{public}@ no longer valid",
                    candidate.description)
@@ -426,6 +457,7 @@ final class AudioManager {
                history.map(\.description).joined(separator: ", "))
         updateStatus("Owner: \(candidate.description)")
         rebuildMuteSet(all)
+        emitTabCommands()
     }
 
     /// Derives the process-level mute set from the owner (design doc §6).
@@ -514,16 +546,21 @@ final class AudioManager {
                 receivedAt: Date(),
                 windowFocused: snapshot.windowFocused,
                 activeTabID: snapshot.activeTabID.flatMap { $0 >= 0 ? $0 : nil },
+                contextID: snapshot.contextID,
                 tabs: tabs
             )
-           runDecision(trigger: "tab_state")
+            migrateBrowserAppOwner(browser: snapshot.browserBundleID, tabs: tabs)
+            runDecision(trigger: "tab_state")
            command = tabCommand(for: snapshot.browserBundleID, contextID: snapshot.contextID)
             let active = snapshot.activeTabID.flatMap { $0 >= 0 ? $0 : nil }
             let audibleCount = tabs.values.filter { $0.audible }.count
             let activeAudible = active.flatMap { tabs[$0]?.audible } ?? false
             os_log(.info, log: Self.log,
-                   "tabCmd %{public}@ active=%d activeAudible=%d audibleTabs=%d cmd=%{public}@",
-                   snapshot.browserBundleID, active ?? -1, activeAudible ? 1 : 0, audibleCount,
+                   "tabCmd %{public}@ windowFocused=%d age=%.2fs active=%d activeAudible=%d audibleTabs=%d cmd=%{public}@",
+                   snapshot.browserBundleID,
+                   snapshot.windowFocused ? 1 : 0,
+                   Date().timeIntervalSince(browserFacts[snapshot.browserBundleID]?.receivedAt ?? Date()),
+                   active ?? -1, activeAudible ? 1 : 0, audibleCount,
                    command["muteAll"] as? Bool == true ? "muteAll"
                    : (command["noAction"] as? Bool == true ? "noAction" : "unmute+muteOthers"))
        }
@@ -532,6 +569,54 @@ final class AudioManager {
 
     /// Tab-level commands derived from the owner (design doc §6): only the
    /// owner browser gets actions; everyone else is handled at process level.
+    /// Process-level ownership of an extension-managed browser is not a real
+    /// source. As soon as tab facts arrive, replace `.app(browser)` with the
+    /// concrete tab that is producing sound (or with nil) so background-tab
+    /// audio cannot ride on a whole-browser identity.
+    private func migrateBrowserAppOwner(browser: String, tabs: [Int: TabFact]) {
+        let appSource = Source.app(browser)
+        history.removeAll { $0 == appSource }
+        guard owner == appSource else { return }
+
+        let playing = tabs.filter { $0.value.audible || $0.value.playing == true }
+        let activeID = browserFacts[browser]?.activeTabID
+        let replacement: Source?
+        if let activeID, playing[activeID] != nil {
+            replacement = .tab(browser: browser, tabID: activeID)
+        } else if let audible = playing.keys.sorted().first {
+            replacement = .tab(browser: browser, tabID: audible)
+        } else {
+            replacement = nil
+        }
+        os_log(.info, log: Self.log,
+               "Owner migration browser=%@ %{public}@ → %{public}@",
+               browser, appSource.description, replacement?.description ?? "nil")
+        owner = replacement
+        pending = nil
+        emitTabCommands()
+    }
+
+    /// Pushes tab commands for every browser we have facts for. Ownership
+    /// changes call this so a switch does not wait for the next 1 Hz snapshot,
+    /// which made the perceived switch time drift between 0.5 s and 2 s.
+    private func emitTabCommands() {
+        guard !browserFacts.isEmpty else { return }
+        var payloads: [[String: Any]] = []
+        for (browser, facts) in browserFacts {
+            payloads.append([
+                "browserBundleID": browser,
+                "contextID": facts.contextID,
+                "command": tabCommand(for: browser, contextID: facts.contextID)
+            ])
+        }
+        os_log(.info, log: Self.log,
+               "pushCommands owner=%{public}@ browsers=%d",
+               owner?.description ?? "nil", payloads.count)
+        DispatchQueue.main.async { [weak self] in
+            self?.delegate?.audioManagerDidIssueTabCommands(payloads)
+        }
+    }
+
     private func tabCommand(for browser: String, contextID: String) -> [String: Any] {
         var command: [String: Any] = ["type": "state_command", "contextID": contextID]
         if case .tab(let ownerBrowser, let ownerTabID) = owner, ownerBrowser == browser {

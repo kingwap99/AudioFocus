@@ -199,19 +199,33 @@ async function mediaIsPlaying(tabId) {
 
 async function buildTabSnapshot() {
   const windows = await browser.windows.getAll({ populate: true, windowTypes: ["normal"] });
-  const activeWindow = (windows || []).find(window => window.focused) || (windows || [])[0] || null;
-  if (!activeWindow) return null;
-  const tabs = activeWindow?.tabs ?? [];
-  const activeTab = tabs.find(tab => tab.active) || tabs[0] || null;
-  const windowFocused = Boolean(activeWindow.focused);
+  if (!windows || windows.length === 0) return null;
+  const focusedWindow = windows.find(window => window.focused) || null;
+  // window.focused is unreliable on macOS (multiple windows/Spaces report
+  // false while the browser is frontmost), so the active tab comes from the
+  // last-focused window, which Chrome tracks independently.
+  const [queriedActive] = await browser.tabs.query({ active: true, lastFocusedWindow: true });
+  const activeTab = queriedActive
+    || (focusedWindow
+      ? (focusedWindow.tabs?.find(tab => tab.active) || focusedWindow.tabs?.[0] || null)
+      : null);
+  // Report every tab in every window. A snapshot limited to the focused window
+  // made an owner tab in another window look "closed", which triggered spurious
+  // ownership recovery while muteOthers still touched every window.
+  const allTabs = windows.flatMap(window => window.tabs || []);
 
-  const snapshotTabs = await Promise.all(tabs.map(async (tab) => {
+  const snapshotTabs = await Promise.all(allTabs.map(async (tab) => {
     // `playing` is the anti-feedback eligibility signal (design §5): it reflects
-    // the page's media elements, never the mute state we imposed.
-    const playing = tab.audible ? null : await mediaIsPlaying(tab.id);
+    // the page's media elements, never the mute state we imposed. Only query it
+    // where the app can use it: the focused window's active tab and tabs we
+    // muted ourselves. Audible tabs already prove they are playing.
+    const needsPlaying = !tab.audible
+      && (tab.id === activeTab?.id || mutedByUs.has(tab.id));
+    const playing = needsPlaying ? await mediaIsPlaying(tab.id) : null;
     return {
       id: tab.id,
-      audible: tab.audible,
+      windowId: tab.windowId,
+      audible: Boolean(tab.audible),
       muted: tab.mutedInfo?.muted ?? false,
       mutedByUs: mutedByUs.has(tab.id),
       playing
@@ -223,7 +237,7 @@ async function buildTabSnapshot() {
     browserBundleID: BROWSER_BUNDLE_ID,
     contextID: "default",
     activeTabID: activeTab?.id ?? -1,
-    windowFocused,
+    windowFocused: Boolean(focusedWindow || activeTab),
     tabs: snapshotTabs
   };
 }
@@ -269,6 +283,9 @@ async function applyStateCommand(message) {
     const tabs = await browser.tabs.query({});
     for (const tab of tabs) {
       if (tab.id === muteOthers.tabID) continue;
+      // Only fade/mute tabs we haven't already muted, so we don't drive the
+      // owner's volume down on every cycle (the trigger of the "音量被拉回1格"
+      // bug). Audible tabs that aren't ours yet get one fade-out + mute.
       if (tab.audible && !mutedByUs.has(tab.id)) {
         await fadeOutAndMute(tab.id);
       } else if (mutedByUs.has(tab.id) && !tab.mutedInfo?.muted) {
@@ -283,11 +300,20 @@ async function applyStateCommand(message) {
     }
   }
 
-  if (unmuteAction) {
+  if (unmuteAction && !mutedByUser.has(unmuteAction.tabID)) {
+    // Fade the owner back in ONLY when it is currently muted by us; an already
+    // audible owner must be left alone so the user's volume slider sticks.
     if (mutedByUs.has(unmuteAction.tabID)) {
       await fadeIn(unmuteAction.tabID);
     } else {
-      try { await browser.tabs.update(unmuteAction.tabID, { muted: false }); } catch (_) {}
+      // A mute we did not apply belongs to the user; record it and leave it be.
+      try {
+        const tab = await browser.tabs.get(unmuteAction.tabID);
+        if (tab?.mutedInfo?.muted) {
+          mutedByUser.add(unmuteAction.tabID);
+          saveState();
+        }
+      } catch (_) {}
     }
   }
 }

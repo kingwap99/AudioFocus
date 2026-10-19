@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "AudioFocus Tab Controller",
-  "version": "1.3.3",
+  "version": "1.3.4",
   "description": "Keeps the last focused audible tab playing and fades other tabs out.",
   "permissions": ["tabs", "nativeMessaging", "webNavigation", "storage", "<all_urls>"],
   "background": {

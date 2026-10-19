@@ -400,6 +400,29 @@ extension AppDelegate: AudioManagerDelegate {
     func audioManagerDidChangeStatus(_ status: String) {
         audioStatus = status
     }
+
+    /// Ownership changed inside AudioManager; push the resulting tab commands
+    /// immediately so the extension does not have to wait for its next tick.
+    func audioManagerDidIssueTabCommands(_ commands: [[String: Any]]) {
+        for entry in commands {
+            guard let browser = entry["browserBundleID"] as? String,
+                  let contextID = entry["contextID"] as? String,
+                  let command = entry["command"] as? [String: Any] else { continue }
+            let userInfo: [String: Any] = [
+                SettingsBridge.payloadKey: [
+                    "browserBundleID": browser,
+                    "contextID": contextID,
+                    "command": command
+                ]
+            ]
+            DistributedNotificationCenter.default().postNotificationName(
+                SettingsBridge.tabCommandNotification,
+                object: nil,
+                userInfo: userInfo,
+                deliverImmediately: true
+            )
+        }
+    }
 }
 
 extension NSMenu {
